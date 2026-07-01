@@ -3,6 +3,17 @@
 // It signs every request from an app key automatically (HMAC-SHA512) and verifies
 // inbound webhooks. Server-side only — your API key and signing secret must never
 // reach a browser. Zero third-party dependencies (standard library only).
+//
+// Typical use:
+//
+//	ap, err := absolutepay.New("ap_live_...", absolutepay.WithSigningSecret("apisign_..."))
+//	if err != nil {
+//		log.Fatal(err)
+//	}
+//	balances, err := ap.Balances.List(ctx)
+//
+// Every list of scopes required by a call is documented on the service type that
+// exposes it (for example BalancesService needs balances:read).
 package absolutepay
 
 import (
@@ -18,42 +29,56 @@ import (
 	"time"
 )
 
-// The only public API origins. Anything else must be passed via WithBaseURL.
+// Base URLs for the public API. Pass any other origin through WithBaseURL.
 const (
+	// ProductionBaseURL is the live API origin (real funds).
 	ProductionBaseURL = "https://api.absolutepay.io"
-	SandboxBaseURL    = "https://sandbox-api.absolutepay.io"
+	// SandboxBaseURL is the public sandbox API origin (mock funds); select it with WithSandbox.
+	SandboxBaseURL = "https://sandbox-api.absolutepay.io"
 )
 
-// Client is the AbsolutePay API client. Construct it once with New and reuse it;
-// each resource service hangs off it.
+// Client is the AbsolutePay API client. Construct it once with New and reuse it
+// across goroutines; each resource service hangs off it as a field.
 type Client struct {
 	apiKey        string
 	signingSecret string
 	baseURL       string
 	httpClient    *http.Client
 
-	Balances      *BalancesService
-	Fees          *FeesService
-	Payments      *PaymentsService
-	Payouts       *PayoutsService
-	Refunds       *RefundsService
-	Conversions   *ConversionsService
-	Invoices      *InvoicesService
+	// Balances exposes workspace asset balances (scope: balances:read).
+	Balances *BalancesService
+	// Fees exposes fee previews (scope: balances:read).
+	Fees *FeesService
+	// Payments exposes pay-in checkout orders (scope: payments:write).
+	Payments *PaymentsService
+	// Payouts exposes batch on-chain payouts (scopes: payouts:write / payouts:read).
+	Payouts *PayoutsService
+	// Refunds exposes refunds against checkout orders (scope: payments:write).
+	Refunds *RefundsService
+	// Conversions exposes currency conversions (scope: convert:write).
+	Conversions *ConversionsService
+	// Invoices exposes invoices and hosted payment links (scopes: invoices:write / invoices:read).
+	Invoices *InvoicesService
+	// Subscriptions exposes recurring plans and subscriptions (scopes: subscriptions:write / subscriptions:read).
 	Subscriptions *SubscriptionsService
-	GiftCards     *GiftCardsService
-	OffRamp       *OffRampService
-	Transactions  *TransactionsService
+	// GiftCards exposes gift-card issuance and lookup (scopes: balances:read / payments:write).
+	GiftCards *GiftCardsService
+	// OffRamp exposes crypto-to-fiat off-ramp (scopes: payouts:write / payouts:read).
+	OffRamp *OffRampService
+	// Transactions exposes the unified ledger (scope: ledger:read).
+	Transactions *TransactionsService
 }
 
-// Option customizes a Client.
+// Option customizes a Client during New. Options are applied in order.
 type Option func(*Client)
 
-// WithSigningSecret sets the request signing secret (apisign_...). Required for
-// app keys — when set, every request is HMAC-signed.
+// WithSigningSecret sets the request signing secret (apisign_...). It is required
+// for app keys: when set, the client HMAC-SHA512-signs every request automatically.
+// secret is the raw signing secret string. Keep it server-side only.
 func WithSigningSecret(secret string) Option { return func(c *Client) { c.signingSecret = secret } }
 
-// WithSandbox targets the public sandbox host instead of production. Ignored when
-// WithBaseURL is also set.
+// WithSandbox targets the public sandbox host instead of production when sandbox is
+// true. It is ignored if WithBaseURL is also set (WithBaseURL wins).
 func WithSandbox(sandbox bool) Option {
 	return func(c *Client) {
 		if sandbox && c.baseURL == "" {
@@ -62,19 +87,35 @@ func WithSandbox(sandbox bool) Option {
 	}
 }
 
-// WithBaseURL overrides the API origin entirely (takes precedence over WithSandbox).
+// WithBaseURL overrides the API origin entirely, e.g. a local dev server. It takes
+// precedence over WithSandbox. baseURL must use https unless the host is localhost
+// or 127.0.0.1; a non-https, non-local URL makes New return an error.
 func WithBaseURL(baseURL string) Option { return func(c *Client) { c.baseURL = baseURL } }
 
-// WithHTTPClient sets a custom *http.Client (timeouts, transport, proxy).
+// WithHTTPClient sets a custom *http.Client, letting you control timeouts,
+// transport, proxy, and TLS. It replaces the default 30s-timeout client.
 func WithHTTPClient(hc *http.Client) Option { return func(c *Client) { c.httpClient = hc } }
 
-// WithTimeout sets the per-request timeout on the default HTTP client.
+// WithTimeout replaces the HTTP client with a fresh *http.Client whose per-request
+// timeout is d. Use WithHTTPClient instead if you need to configure more than the timeout.
 func WithTimeout(d time.Duration) Option {
 	return func(c *Client) { c.httpClient = &http.Client{Timeout: d} }
 }
 
-// New builds a Client. apiKey is required (ap_live_ / ap_test_). Options can set
-// the signing secret, sandbox/base URL, and HTTP client.
+// New builds a Client. apiKey is required and identifies your workspace
+// (ap_live_... for production, ap_test_... for sandbox/test). Pass Options to set
+// the signing secret, choose sandbox/base URL, or supply a custom HTTP client. It
+// returns an error if apiKey is empty or the resolved base URL is invalid or a
+// non-https, non-localhost origin. Example:
+//
+//	ap, err := absolutepay.New(
+//		"ap_live_...",
+//		absolutepay.WithSigningSecret("apisign_..."),
+//	)
+//	if err != nil {
+//		return err
+//	}
+//	balances, err := ap.Balances.List(ctx)
 func New(apiKey string, opts ...Option) (*Client, error) {
 	if apiKey == "" {
 		return nil, fmt.Errorf("absolutepay: apiKey is required")

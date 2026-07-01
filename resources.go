@@ -7,15 +7,20 @@ import (
 	"strconv"
 )
 
-// JSON is a loosely-typed object returned by endpoints without a dedicated struct.
+// JSON is a loosely-typed object returned by endpoints that have no dedicated
+// response struct. It is an alias for map[string]any; read fields by key, e.g.
+// resp["orderId"]. Values follow encoding/json defaults (numbers decode to float64).
 type JSON = map[string]any
 
-// RequestOption sets per-request extras (e.g. an idempotency key). These headers
-// are merged AFTER signing and are not part of the signed canonical string.
+// RequestOption sets per-request extras such as an idempotency key. The resulting
+// headers are merged AFTER request signing and are therefore NOT part of the signed
+// canonical string.
 type RequestOption func(map[string]string)
 
-// WithIdempotencyKey makes a write retry-safe — the same key returns the original
-// result instead of acting twice.
+// WithIdempotencyKey makes a write retry-safe: replaying a request with the same
+// key returns the original result instead of performing the action twice. key is a
+// caller-chosen unique string (e.g. a UUID) that you reuse across retries of the
+// same logical operation.
 func WithIdempotencyKey(key string) RequestOption {
 	return func(h map[string]string) { h["Idempotency-Key"] = key }
 }
@@ -35,15 +40,19 @@ func seg(s string) string { return url.PathEscape(s) }
 
 // --- Balances (scope: balances:read) ---
 
+// BalancesService reads workspace asset balances. Requires the balances:read scope.
 type BalancesService struct{ c *Client }
 
-// List returns every asset balance for the workspace.
+// List returns every asset balance for the workspace. ctx controls
+// cancellation/deadline. It returns one Balance per asset, or an error.
 func (s *BalancesService) List(ctx context.Context) ([]Balance, error) {
 	var out []Balance
 	return out, s.c.do(ctx, http.MethodGet, "/v1/balances", nil, nil, &out)
 }
 
-// Summary values the whole balance in one quote currency (default USDT).
+// Summary values the whole balance in a single quote currency. quote is the
+// currency code to value in (e.g. "USDT"); pass "" to use the server default
+// (USDT). It returns a loosely-typed JSON summary, or an error.
 func (s *BalancesService) Summary(ctx context.Context, quote string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/balances/summary"+qs(map[string]string{"quote": quote}), nil, nil, &out)
@@ -51,9 +60,14 @@ func (s *BalancesService) Summary(ctx context.Context, quote string) (JSON, erro
 
 // --- Fees (scope: balances:read) ---
 
+// FeesService previews fees before you commit to an operation. Requires the
+// balances:read scope.
 type FeesService struct{ c *Client }
 
-// Preview returns the total fee on an amount for a payment type (default CHECKOUT).
+// Preview returns the fee breakdown for an amount and payment type. amount is the
+// decimal-string value; currency is its code (e.g. "USDT"); paymentType is one of
+// the Payment* constants (pass "" for the default CHECKOUT). It returns a
+// *FeePreview, or an error.
 func (s *FeesService) Preview(ctx context.Context, amount, currency string, paymentType PaymentType) (*FeePreview, error) {
 	var out FeePreview
 	q := qs(map[string]string{"amount": amount, "currency": currency, "paymentType": paymentType})
@@ -62,27 +76,49 @@ func (s *FeesService) Preview(ctx context.Context, amount, currency string, paym
 
 // --- Payments (scope: payments:write) ---
 
+// PaymentsService creates and looks up pay-in checkout orders. Requires the
+// payments:write scope.
 type PaymentsService struct{ c *Client }
 
-// CheckoutParams is the body for CreateCheckout.
+// CheckoutParams is the request body for CreateCheckout.
 type CheckoutParams struct {
+	// MerchantTradeNo is your unique order reference. Optional: the server generates
+	// one when omitted. Use it later with GetCheckout.
 	MerchantTradeNo string `json:"merchantTradeNo,omitempty"`
-	Amount          Money  `json:"amount"`
-	Chain           string `json:"chain"`
-	MerchantUserID  int64  `json:"merchantUserId"`
-	GoodsName       string `json:"goodsName"`
-	TerminalType    string `json:"terminalType,omitempty"`
-	ExpiresIn       int    `json:"expiresIn,omitempty"`
-	Method          string `json:"method,omitempty"`
+	// Amount is the order amount and currency to charge.
+	Amount Money `json:"amount"`
+	// Chain is the blockchain network for the pay-in, e.g. "TRX", "ETH".
+	Chain string `json:"chain"`
+	// MerchantUserID is your identifier for the paying customer.
+	MerchantUserID int64 `json:"merchantUserId"`
+	// GoodsName is a human-readable description of what is being purchased.
+	GoodsName string `json:"goodsName"`
+	// TerminalType is the checkout surface, e.g. "WEB" or "APP". Optional.
+	TerminalType string `json:"terminalType,omitempty"`
+	// ExpiresIn is the order lifetime in seconds before it expires. Optional (0 = server default).
+	ExpiresIn int `json:"expiresIn,omitempty"`
+	// Method is the payment method hint. Optional.
+	Method string `json:"method,omitempty"`
 }
 
-// CreateCheckout creates a pay-in order.
+// CreateCheckout creates a pay-in order (the customer pays the merchant) and
+// returns the order details as JSON (order id, pay URL/address, status, etc.).
+// It returns an error if the request is rejected. Example:
+//
+//	order, err := ap.Payments.CreateCheckout(ctx, absolutepay.CheckoutParams{
+//		Amount:         absolutepay.Money{Amount: "10.00", Currency: "USDT"},
+//		Chain:          "TRX",
+//		MerchantUserID: 42,
+//		GoodsName:      "Pro plan",
+//	})
 func (s *PaymentsService) CreateCheckout(ctx context.Context, p CheckoutParams) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/checkout", p, nil, &out)
 }
 
-// GetCheckout looks up a checkout by merchant trade number.
+// GetCheckout looks up a checkout order by its merchant trade number.
+// merchantTradeNo is the reference from CheckoutParams (or the server-generated
+// one). It returns the order state as JSON, or an error.
 func (s *PaymentsService) GetCheckout(ctx context.Context, merchantTradeNo string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/checkout/"+seg(merchantTradeNo), nil, nil, &out)
@@ -90,29 +126,49 @@ func (s *PaymentsService) GetCheckout(ctx context.Context, merchantTradeNo strin
 
 // --- Payouts (scopes: payouts:write / payouts:read) ---
 
+// PayoutsService sends batch on-chain payouts and reads their status. Creating a
+// payout requires payouts:write; reads require payouts:read.
 type PayoutsService struct{ c *Client }
 
 // PayoutItem is one recipient in a batch payout.
 type PayoutItem struct {
+	// RecipientAddress is the destination on-chain wallet address.
 	RecipientAddress string `json:"recipientAddress"`
-	Chain            string `json:"chain"`
-	Amount           Money  `json:"amount"`
-	Memo             string `json:"memo,omitempty"`
+	// Chain is the blockchain network to send over, e.g. "TRX", "ETH".
+	Chain string `json:"chain"`
+	// Amount is the amount and currency to send to this recipient.
+	Amount Money `json:"amount"`
+	// Memo is an optional destination memo/tag (required by some chains/exchanges).
+	Memo string `json:"memo,omitempty"`
 }
 
-// Create submits a batch payout. Pass WithIdempotencyKey to make retries safe.
+// Create submits a batch payout of items and returns the batch details as JSON.
+// Pass WithIdempotencyKey to make retries safe: replaying with the same key returns
+// the original batch instead of paying twice. It returns an error if rejected.
+// Example:
+//
+//	batch, err := ap.Payouts.Create(ctx,
+//		[]absolutepay.PayoutItem{{
+//			RecipientAddress: "T...",
+//			Chain:            "TRX",
+//			Amount:           absolutepay.Money{Amount: "5.00", Currency: "USDT"},
+//		}},
+//		absolutepay.WithIdempotencyKey("payout-2026-06-01-001"),
+//	)
 func (s *PayoutsService) Create(ctx context.Context, items []PayoutItem, opts ...RequestOption) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/payouts", map[string]any{"items": items}, headersFrom(opts), &out)
 }
 
-// Options lists supported chains + per-chain withdraw fee/limits for a currency.
+// Options lists the supported chains plus the per-chain withdraw fee and limits for
+// a currency. currency is the asset code (e.g. "USDT"). It returns the options as
+// JSON, or an error.
 func (s *PayoutsService) Options(ctx context.Context, currency string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/payouts/options"+qs(map[string]string{"currency": currency}), nil, nil, &out)
 }
 
-// Get looks up a payout batch by id.
+// Get looks up a payout batch by its id and returns its status as JSON, or an error.
 func (s *PayoutsService) Get(ctx context.Context, id string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/payouts/"+seg(id), nil, nil, &out)
@@ -120,21 +176,35 @@ func (s *PayoutsService) Get(ctx context.Context, id string) (JSON, error) {
 
 // --- Refunds (scope: payments:write) ---
 
+// RefundsService issues and looks up refunds against checkout orders. Requires the
+// payments:write scope.
 type RefundsService struct{ c *Client }
 
-// RefundParams is the body for Create.
+// RefundParams is the request body for Create.
 type RefundParams struct {
+	// MerchantTradeNo is the order reference of the checkout being refunded.
 	MerchantTradeNo string `json:"merchantTradeNo"`
-	Amount          Money  `json:"amount"`
-	Reason          string `json:"reason,omitempty"`
+	// Amount is the amount and currency to refund (may be a partial amount).
+	Amount Money `json:"amount"`
+	// Reason is an optional human-readable refund reason.
+	Reason string `json:"reason,omitempty"`
 }
 
+// Create issues a refund against a settled checkout order and returns the refund
+// details as JSON (including a refundRequestId), or an error. Example:
+//
+//	refund, err := ap.Refunds.Create(ctx, absolutepay.RefundParams{
+//		MerchantTradeNo: "order-123",
+//		Amount:          absolutepay.Money{Amount: "10.00", Currency: "USDT"},
+//		Reason:          "customer request",
+//	})
 func (s *RefundsService) Create(ctx context.Context, p RefundParams) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/refunds", p, nil, &out)
 }
 
-// Get looks up a refund by its refundRequestId.
+// Get looks up a refund by its refundRequestId and returns its status as JSON, or
+// an error.
 func (s *RefundsService) Get(ctx context.Context, id string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/refunds/"+seg(id), nil, nil, &out)
@@ -142,46 +212,73 @@ func (s *RefundsService) Get(ctx context.Context, id string) (JSON, error) {
 
 // --- Conversions (scope: convert:write) ---
 
+// ConversionsService quotes and executes currency conversions. Requires the
+// convert:write scope.
 type ConversionsService struct{ c *Client }
 
-// QuoteParams requests a conversion quote. Set exactly one of SellAmount / BuyAmount.
+// QuoteParams requests a conversion quote. Set exactly one of SellAmount or
+// BuyAmount to fix that side; the other is computed from the rate.
 type QuoteParams struct {
+	// SellCurrency is the currency code you are converting from.
 	SellCurrency string `json:"sellCurrency"`
-	BuyCurrency  string `json:"buyCurrency"`
-	SellAmount   string `json:"sellAmount,omitempty"`
-	BuyAmount    string `json:"buyAmount,omitempty"`
+	// BuyCurrency is the currency code you are converting to.
+	BuyCurrency string `json:"buyCurrency"`
+	// SellAmount fixes the amount to sell, as a decimal string. Optional (set this OR BuyAmount).
+	SellAmount string `json:"sellAmount,omitempty"`
+	// BuyAmount fixes the amount to buy, as a decimal string. Optional (set this OR SellAmount).
+	BuyAmount string `json:"buyAmount,omitempty"`
 }
 
-// ConvertQuote is a conversion quote.
+// ConvertQuote is a conversion quote returned by Quote. It is short-lived; pass its
+// QuoteID to Execute to lock in the trade.
 type ConvertQuote struct {
-	QuoteID      string `json:"quoteId"`
-	Rate         string `json:"rate"`
-	SellCurrency string `json:"sellCurrency"`
-	SellAmount   string `json:"sellAmount"`
-	BuyCurrency  string `json:"buyCurrency"`
-	BuyAmount    string `json:"buyAmount"`
-}
-
-// ConvertExecuteParams executes a previously quoted conversion.
-type ConvertExecuteParams struct {
+	// QuoteID identifies this quote; pass it to Execute.
 	QuoteID string `json:"quoteId"`
-	Sell    Money  `json:"sell"`
-	Buy     Money  `json:"buy"`
+	// Rate is the quoted exchange rate as a decimal string.
+	Rate string `json:"rate"`
+	// SellCurrency is the currency being sold.
+	SellCurrency string `json:"sellCurrency"`
+	// SellAmount is the amount to be sold, as a decimal string.
+	SellAmount string `json:"sellAmount"`
+	// BuyCurrency is the currency being bought.
+	BuyCurrency string `json:"buyCurrency"`
+	// BuyAmount is the amount to be bought, as a decimal string.
+	BuyAmount string `json:"buyAmount"`
 }
 
-// Quote previews a conversion (no funds move).
+// ConvertExecuteParams executes a previously obtained conversion quote.
+type ConvertExecuteParams struct {
+	// QuoteID is the id from the ConvertQuote returned by Quote.
+	QuoteID string `json:"quoteId"`
+	// Sell is the amount and currency to sell (must match the quote).
+	Sell Money `json:"sell"`
+	// Buy is the amount and currency to buy (must match the quote).
+	Buy Money `json:"buy"`
+}
+
+// Quote previews a conversion without moving any funds and returns a *ConvertQuote
+// (rate and both legs), or an error. Follow with Execute to commit it.
 func (s *ConversionsService) Quote(ctx context.Context, p QuoteParams) (*ConvertQuote, error) {
 	var out ConvertQuote
 	return &out, s.c.do(ctx, http.MethodPost, "/v1/conversions/quote", p, nil, &out)
 }
 
-// Execute runs a previously quoted conversion.
+// Execute runs a previously quoted conversion (this moves funds) and returns the
+// result as JSON, or an error.
 func (s *ConversionsService) Execute(ctx context.Context, p ConvertExecuteParams) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/conversions", p, nil, &out)
 }
 
-// Convert quotes then executes in one call.
+// Convert quotes then immediately executes a conversion in one call — a convenience
+// wrapper over Quote + Execute. p describes the legs (see QuoteParams). It returns
+// the executed conversion as JSON, or an error from either step. Example:
+//
+//	res, err := ap.Conversions.Convert(ctx, absolutepay.QuoteParams{
+//		SellCurrency: "USDT",
+//		BuyCurrency:  "BTC",
+//		SellAmount:   "100.00",
+//	})
 func (s *ConversionsService) Convert(ctx context.Context, p QuoteParams) (JSON, error) {
 	q, err := s.Quote(ctx, p)
 	if err != nil {
@@ -196,67 +293,105 @@ func (s *ConversionsService) Convert(ctx context.Context, p QuoteParams) (JSON, 
 
 // --- Invoices + hosted payment links (scopes: invoices:write / invoices:read) ---
 
+// InvoicesService creates and manages invoices and hosted payment links. Writes
+// require invoices:write; reads require invoices:read. Payer-facing endpoints that
+// need no API key live under Public.
 type InvoicesService struct {
 	c *Client
-	// Public holds the unauthenticated payer-facing endpoints.
+	// Public holds the unauthenticated, payer-facing invoice endpoints.
 	Public *PublicInvoicesService
 }
 
-// InvoiceParams is the body for Create / CreateCheckout. Set Chain on Create to
-// mint the deposit address up front.
+// InvoiceParams is the request body for Create and CreateCheckout. On Create, set
+// Chain to mint the deposit address up front; CreateCheckout ignores Chain and lets
+// the payer choose the network.
 type InvoiceParams struct {
-	Reference     string `json:"reference"`
-	Amount        Money  `json:"amount"`
-	Description   string `json:"description,omitempty"`
+	// Reference is your unique invoice reference.
+	Reference string `json:"reference"`
+	// Amount is the amount and currency to bill.
+	Amount Money `json:"amount"`
+	// Description is an optional human-readable line item / memo.
+	Description string `json:"description,omitempty"`
+	// CustomerEmail is the payer's email, used for receipts/notifications. Optional.
 	CustomerEmail string `json:"customerEmail,omitempty"`
-	ExpiresAt     int64  `json:"expiresAt,omitempty"`
-	Chain         string `json:"chain,omitempty"`
+	// ExpiresAt is the expiry time in epoch milliseconds. Optional (0 = no explicit expiry).
+	ExpiresAt int64 `json:"expiresAt,omitempty"`
+	// Chain is the blockchain network. On Create it mints the deposit address up
+	// front; ignored by CreateCheckout. Optional.
+	Chain string `json:"chain,omitempty"`
 }
 
+// Create creates a fixed-asset invoice and returns it as JSON (including its token
+// and, if Chain was set, a deposit address), or an error.
 func (s *InvoicesService) Create(ctx context.Context, p InvoiceParams) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/invoices", p, nil, &out)
 }
 
-// CreateCheckout creates a hosted checkout link (the payer picks the asset).
+// CreateCheckout creates a hosted checkout link where the payer picks the asset and
+// network at pay time. Any Chain in p is cleared. It returns the link as JSON
+// (including its token/URL), or an error.
 func (s *InvoicesService) CreateCheckout(ctx context.Context, p InvoiceParams) (JSON, error) {
 	p.Chain = "" // checkout links let the payer choose the network
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/checkouts", p, nil, &out)
 }
 
-// List returns a keyset-paginated page. Pass a prior page's NextCursor as
-// PageQuery.Before for the next page; NextCursor is nil on the last page.
+// List returns a keyset-paginated page of invoices. q sets the page size, cursor,
+// and optional status filter (see PageQuery). Pass a prior page's Page.NextCursor
+// as q.Before for the next page; NextCursor is nil on the last page. Example:
+//
+//	q := absolutepay.PageQuery{Limit: 50}
+//	for {
+//		page, err := ap.Invoices.List(ctx, q)
+//		if err != nil {
+//			return err
+//		}
+//		// ... process page.Items ...
+//		if page.NextCursor == nil {
+//			break
+//		}
+//		q.Before = *page.NextCursor
+//	}
 func (s *InvoicesService) List(ctx context.Context, q PageQuery) (*Page, error) {
 	var out Page
 	return &out, s.c.do(ctx, http.MethodGet, "/v1/invoices"+pageQuery(q), nil, nil, &out)
 }
 
+// Stats returns aggregate invoice statistics for the workspace as JSON, or an error.
 func (s *InvoicesService) Stats(ctx context.Context) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/invoices/stats", nil, nil, &out)
 }
 
-// Pause pauses or unpauses an open invoice/link.
+// Pause pauses or unpauses an open invoice or payment link. token identifies the
+// invoice; paused=true pauses it and paused=false resumes it. It returns the
+// updated state as JSON, or an error.
 func (s *InvoicesService) Pause(ctx context.Context, token string, paused bool) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/invoices/"+seg(token)+"/pause", map[string]bool{"paused": paused}, nil, &out)
 }
 
-// Void makes an invoice/link permanently unpayable.
+// Void makes an invoice or payment link permanently unpayable. token identifies the
+// invoice. It returns the updated state as JSON, or an error.
 func (s *InvoicesService) Void(ctx context.Context, token string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/invoices/"+seg(token)+"/void", nil, nil, &out)
 }
 
-// PublicInvoicesService holds the unauthenticated payer endpoints (no API key).
+// PublicInvoicesService holds the unauthenticated, payer-facing invoice endpoints
+// (no API key required). Reach it via InvoicesService.Public. token is the public
+// invoice token shown to the payer.
 type PublicInvoicesService struct{ c *Client }
 
+// Get returns the public view of an invoice by token as JSON, or an error.
 func (s *PublicInvoicesService) Get(ctx context.Context, token string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/public/invoices/"+seg(token), nil, nil, &out)
 }
 
+// Assets lists the assets/networks the payer can use to pay the invoice identified
+// by token. It returns one JSON object per payable asset, or an error.
 func (s *PublicInvoicesService) Assets(ctx context.Context, token string) ([]JSON, error) {
 	var out []JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/public/invoices/"+seg(token)+"/assets", nil, nil, &out)
@@ -264,21 +399,32 @@ func (s *PublicInvoicesService) Assets(ctx context.Context, token string) ([]JSO
 
 // DepositParams selects the asset for a hosted-invoice deposit.
 type DepositParams struct {
-	Currency     string `json:"currency"`
-	Chain        string `json:"chain"`
+	// Currency is the asset code the payer chose, e.g. "USDT".
+	Currency string `json:"currency"`
+	// Chain is the blockchain network for the deposit, e.g. "TRX".
+	Chain string `json:"chain"`
+	// FullCurrType is the provider's fully-qualified currency/network identifier
+	// (as returned by Assets).
 	FullCurrType string `json:"fullCurrType"`
 }
 
+// Deposit selects an asset for the invoice identified by token and returns the
+// deposit instructions (address/amount) as JSON, or an error.
 func (s *PublicInvoicesService) Deposit(ctx context.Context, token string, p DepositParams) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/public/invoices/"+seg(token)+"/deposit", p, nil, &out)
 }
 
+// Quote returns the amount of currency required to pay the invoice identified by
+// token. currency is the asset code the payer wants to pay in. It returns the quote
+// as JSON, or an error.
 func (s *PublicInvoicesService) Quote(ctx context.Context, token, currency string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/public/invoices/"+seg(token)+"/quote", map[string]string{"currency": currency}, nil, &out)
 }
 
+// Status returns the current payment status of the invoice identified by token as
+// JSON, or an error. Poll this from the payer-facing page.
 func (s *PublicInvoicesService) Status(ctx context.Context, token string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/public/invoices/"+seg(token)+"/status", nil, nil, &out)
@@ -286,52 +432,74 @@ func (s *PublicInvoicesService) Status(ctx context.Context, token string) (JSON,
 
 // --- Subscriptions (scopes: subscriptions:read / subscriptions:write) ---
 
+// SubscriptionsService manages recurring billing plans and subscriptions. Writes
+// require subscriptions:write; reads require subscriptions:read.
 type SubscriptionsService struct{ c *Client }
 
 // PlanParams defines a recurring billing plan.
 type PlanParams struct {
+	// MerchantPlanNo is your unique plan reference.
 	MerchantPlanNo string `json:"merchantPlanNo"`
-	Name           string `json:"name"`
-	Amount         Money  `json:"amount"`
-	Interval       string `json:"interval"`
-	IntervalCount  int    `json:"intervalCount"`
-	TotalCycles    int    `json:"totalCycles"`
+	// Name is the human-readable plan name.
+	Name string `json:"name"`
+	// Amount is the amount and currency charged each cycle.
+	Amount Money `json:"amount"`
+	// Interval is the billing interval unit, e.g. "DAY", "WEEK", "MONTH", "YEAR".
+	Interval string `json:"interval"`
+	// IntervalCount is the number of Interval units between charges (e.g. 3 with "MONTH" = quarterly).
+	IntervalCount int `json:"intervalCount"`
+	// TotalCycles is the number of charges before the subscription ends (0 = unlimited).
+	TotalCycles int `json:"totalCycles"`
 }
 
-// SubscribeParams subscribes a customer to a plan.
+// SubscribeParams subscribes a customer to an existing plan.
 type SubscribeParams struct {
+	// MerchantSubNo is your unique subscription reference.
 	MerchantSubNo string `json:"merchantSubNo"`
-	PlanNo        string `json:"planNo"`
-	CallbackURL   string `json:"callbackUrl,omitempty"`
+	// PlanNo is the plan's reference (MerchantPlanNo) to subscribe to.
+	PlanNo string `json:"planNo"`
+	// CallbackURL is an optional per-subscription webhook override URL.
+	CallbackURL string `json:"callbackUrl,omitempty"`
 }
 
+// ListPlans returns the workspace's recurring billing plans as JSON, or an error.
 func (s *SubscriptionsService) ListPlans(ctx context.Context) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/subscription-plans", nil, nil, &out)
 }
 
+// CreatePlan creates a recurring billing plan from p and returns it as JSON, or an
+// error.
 func (s *SubscriptionsService) CreatePlan(ctx context.Context, p PlanParams) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/subscription-plans", p, nil, &out)
 }
 
-// List returns a keyset-paginated page of subscriptions (see PageQuery / Page).
+// List returns a keyset-paginated page of subscriptions. q sets page size, cursor,
+// and optional status filter; pass a prior Page.NextCursor as q.Before for the next
+// page (nil NextCursor means last page). See PageQuery and Page.
 func (s *SubscriptionsService) List(ctx context.Context, q PageQuery) (*Page, error) {
 	var out Page
 	return &out, s.c.do(ctx, http.MethodGet, "/v1/subscriptions"+pageQuery(q), nil, nil, &out)
 }
 
+// Create subscribes a customer to a plan (see SubscribeParams) and returns the new
+// subscription as JSON, or an error.
 func (s *SubscriptionsService) Create(ctx context.Context, p SubscribeParams) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/subscriptions", p, nil, &out)
 }
 
 // Deductions returns the per-cycle charge history for a subscription.
+// merchantSubNo is the subscription reference. It returns the history as JSON, or
+// an error.
 func (s *SubscriptionsService) Deductions(ctx context.Context, merchantSubNo string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/subscriptions/"+seg(merchantSubNo)+"/deductions", nil, nil, &out)
 }
 
+// Cancel cancels a subscription identified by merchantSubNo and returns the updated
+// state as JSON, or an error.
 func (s *SubscriptionsService) Cancel(ctx context.Context, merchantSubNo string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/subscriptions/"+seg(merchantSubNo)+"/cancel", nil, nil, &out)
@@ -339,31 +507,44 @@ func (s *SubscriptionsService) Cancel(ctx context.Context, merchantSubNo string)
 
 // --- Gift cards (scopes: balances:read to read, payments:write to issue) ---
 
+// GiftCardsService issues and looks up gift cards. Reads require balances:read;
+// issuing a card requires payments:write.
 type GiftCardsService struct{ c *Client }
 
 // GiftCardParams issues a gift card.
 type GiftCardParams struct {
-	Title      string `json:"title"`
+	// Title is the gift card's display title.
+	Title string `json:"title"`
+	// TemplateID is the design template id (from Templates) to render the card with.
 	TemplateID string `json:"templateId"`
-	Amount     Money  `json:"amount"`
+	// Amount is the face value and currency loaded onto the card.
+	Amount Money `json:"amount"`
 }
 
+// Templates returns the available gift-card design templates as JSON, or an error.
+// Use a returned template's id as GiftCardParams.TemplateID.
 func (s *GiftCardsService) Templates(ctx context.Context) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/giftcards/templates", nil, nil, &out)
 }
 
-// List returns a keyset-paginated page of issued gift cards (see PageQuery / Page).
+// List returns a keyset-paginated page of issued gift cards. q sets page size,
+// cursor, and optional status filter; pass a prior Page.NextCursor as q.Before for
+// the next page (nil NextCursor means last page). See PageQuery and Page.
 func (s *GiftCardsService) List(ctx context.Context, q PageQuery) (*Page, error) {
 	var out Page
 	return &out, s.c.do(ctx, http.MethodGet, "/v1/giftcards"+pageQuery(q), nil, nil, &out)
 }
 
+// Get looks up an issued gift card by its card number (cardNum) and returns it as
+// JSON, or an error.
 func (s *GiftCardsService) Get(ctx context.Context, cardNum string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/giftcards/"+seg(cardNum), nil, nil, &out)
 }
 
+// Create issues a gift card from p and returns it as JSON (including its card
+// number), or an error.
 func (s *GiftCardsService) Create(ctx context.Context, p GiftCardParams) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/giftcards", p, nil, &out)
@@ -371,46 +552,68 @@ func (s *GiftCardsService) Create(ctx context.Context, p GiftCardParams) (JSON, 
 
 // --- Off-ramp (scopes: payouts:read / payouts:write) ---
 
+// OffRampService converts crypto to fiat and pays out to a registered bank
+// account. Reads require payouts:read; quoting/withdrawing require payouts:write.
 type OffRampService struct{ c *Client }
 
-// OffRampQuoteParams requests a crypto→fiat quote.
+// OffRampQuoteParams requests a crypto-to-fiat quote.
 type OffRampQuoteParams struct {
+	// CryptoCurrency is the asset code being sold, e.g. "USDT".
 	CryptoCurrency string `json:"cryptoCurrency"`
-	FiatCurrency   string `json:"fiatCurrency"`
-	CryptoAmount   string `json:"cryptoAmount"`
+	// FiatCurrency is the target fiat currency code, e.g. "USD", "EUR".
+	FiatCurrency string `json:"fiatCurrency"`
+	// CryptoAmount is the amount of crypto to sell, as a decimal string.
+	CryptoAmount string `json:"cryptoAmount"`
 }
 
-// OffRampWithdrawParams executes an off-ramp against a quote + registered bank.
+// OffRampWithdrawParams executes an off-ramp against a prior quote and a registered
+// bank account.
 type OffRampWithdrawParams struct {
-	QuoteToken     string `json:"quoteToken"`
-	BankAccountID  string `json:"bankAccountId"`
+	// QuoteToken is the token from the OffRampService.Quote response.
+	QuoteToken string `json:"quoteToken"`
+	// BankAccountID identifies the registered destination bank account.
+	BankAccountID string `json:"bankAccountId"`
+	// CryptoCurrency is the asset code being sold (must match the quote).
 	CryptoCurrency string `json:"cryptoCurrency"`
-	FiatCurrency   string `json:"fiatCurrency"`
-	CryptoAmount   string `json:"cryptoAmount"`
-	FiatAmount     string `json:"fiatAmount"`
+	// FiatCurrency is the target fiat currency code (must match the quote).
+	FiatCurrency string `json:"fiatCurrency"`
+	// CryptoAmount is the crypto amount to sell, as a decimal string (must match the quote).
+	CryptoAmount string `json:"cryptoAmount"`
+	// FiatAmount is the fiat amount to receive, as a decimal string (from the quote).
+	FiatAmount string `json:"fiatAmount"`
 }
 
+// Countries returns the fiat destination countries supported for off-ramp as JSON,
+// or an error.
 func (s *OffRampService) Countries(ctx context.Context) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/offramp/countries", nil, nil, &out)
 }
 
+// Banks returns the workspace's registered destination bank accounts as JSON, or an
+// error. Use a returned account's id as OffRampWithdrawParams.BankAccountID.
 func (s *OffRampService) Banks(ctx context.Context) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/offramp/banks", nil, nil, &out)
 }
 
+// Quote returns a crypto-to-fiat quote (including a quote token and fiat amount) for
+// p as JSON, or an error. Follow with Withdraw to execute it.
 func (s *OffRampService) Quote(ctx context.Context, p OffRampQuoteParams) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/offramp/quote", p, nil, &out)
 }
 
+// Withdraw executes an off-ramp against a quote and registered bank account (see
+// OffRampWithdrawParams) and returns the order as JSON, or an error.
 func (s *OffRampService) Withdraw(ctx context.Context, p OffRampWithdrawParams) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/offramp/withdraw", p, nil, &out)
 }
 
-// Orders returns a keyset-paginated page of off-ramp orders (see PageQuery / Page).
+// Orders returns a keyset-paginated page of off-ramp orders. q sets page size,
+// cursor, and optional status filter; pass a prior Page.NextCursor as q.Before for
+// the next page (nil NextCursor means last page). See PageQuery and Page.
 func (s *OffRampService) Orders(ctx context.Context, q PageQuery) (*Page, error) {
 	var out Page
 	return &out, s.c.do(ctx, http.MethodGet, "/v1/offramp/orders"+pageQuery(q), nil, nil, &out)
@@ -418,19 +621,29 @@ func (s *OffRampService) Orders(ctx context.Context, q PageQuery) (*Page, error)
 
 // --- Transactions / unified ledger (scope: ledger:read) ---
 
+// TransactionsService reads the unified ledger across all operation types. Requires
+// the ledger:read scope.
 type TransactionsService struct{ c *Client }
 
-// TransactionsQuery filters the ledger. From/To are epoch milliseconds; page with
-// Limit/Offset. Format "csv" returns an export.
+// TransactionsQuery filters the ledger. All fields are optional; zero/empty fields
+// are omitted from the request.
 type TransactionsQuery struct {
+	// Currency filters to a single asset code, e.g. "USDT". "" = all currencies.
 	Currency string
-	From     int64
-	To       int64
-	Limit    int
-	Offset   int
-	Format   string
+	// From is the inclusive start of the time range, in epoch milliseconds (0 = unbounded).
+	From int64
+	// To is the inclusive end of the time range, in epoch milliseconds (0 = unbounded).
+	To int64
+	// Limit is the maximum number of rows to return (0 = server default).
+	Limit int
+	// Offset is the number of rows to skip for offset-based pagination.
+	Offset int
+	// Format selects the response format; "csv" returns an export instead of JSON.
+	Format string
 }
 
+// List returns ledger entries matching q as JSON, or an error. When q.Format is
+// "csv" the response is a CSV export. See TransactionsQuery for the filters.
 func (s *TransactionsService) List(ctx context.Context, q TransactionsQuery) (JSON, error) {
 	m := map[string]string{"currency": q.Currency, "format": q.Format}
 	if q.From > 0 {
