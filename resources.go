@@ -430,6 +430,13 @@ func (s *PublicInvoicesService) Status(ctx context.Context, token string) (JSON,
 	return out, s.c.do(ctx, http.MethodGet, "/v1/public/invoices/"+seg(token)+"/status", nil, nil, &out)
 }
 
+// TrackOpen records that the payer opened the hosted invoice identified by token
+// (an analytics/engagement signal). It sends no body and ignores the response,
+// returning only an error if the request is rejected.
+func (s *PublicInvoicesService) TrackOpen(ctx context.Context, token string) error {
+	return s.c.do(ctx, http.MethodPost, "/v1/public/invoices/"+seg(token)+"/open", nil, nil, nil)
+}
+
 // --- Subscriptions (scopes: subscriptions:read / subscriptions:write) ---
 
 // SubscriptionsService manages recurring billing plans and subscriptions. Writes
@@ -619,6 +626,71 @@ func (s *OffRampService) Orders(ctx context.Context, q PageQuery) (*Page, error)
 	return &out, s.c.do(ctx, http.MethodGet, "/v1/offramp/orders"+pageQuery(q), nil, nil, &out)
 }
 
+// DocFile is a base64-encoded document uploaded inline with an off-ramp bank
+// registration or compliance submission (e.g. a proof-of-address certificate or a
+// passport scan).
+type DocFile struct {
+	// Filename is the original file name, e.g. "passport.pdf".
+	Filename string `json:"filename"`
+	// ContentType is the file's MIME type, e.g. "application/pdf" or "image/png".
+	ContentType string `json:"contentType"`
+	// DataBase64 is the file's bytes, base64-encoded (standard encoding, no data: URI prefix).
+	DataBase64 string `json:"dataBase64"`
+}
+
+// BankParams registers a fiat destination bank account for off-ramp withdrawals.
+type BankParams struct {
+	// BankAccountName is the account holder's name as it appears at the bank.
+	BankAccountName string `json:"bankAccountName"`
+	// BankName is the destination bank's name.
+	BankName string `json:"bankName"`
+	// CountryID is the numeric id of the bank's country (from OffRampService.Countries).
+	CountryID int `json:"countryId"`
+	// IBAN is the destination account's IBAN.
+	IBAN string `json:"iban"`
+	// Swift is the bank's SWIFT/BIC code. Optional.
+	Swift string `json:"swift,omitempty"`
+	// Address is the account holder's address. Optional.
+	Address string `json:"address,omitempty"`
+	// RemittanceLineNumber is an optional remittance reference line required by some corridors.
+	RemittanceLineNumber string `json:"remittanceLineNumber,omitempty"`
+	// File is the proof-of-account document uploaded inline (see DocFile).
+	File DocFile `json:"file"`
+}
+
+// BankMaterialsParams submits additional compliance documents for a registered bank
+// account (e.g. when off-ramp review requests more materials).
+type BankMaterialsParams struct {
+	// Certificate holds proof-of-account / certificate documents.
+	Certificate []DocFile `json:"certificate"`
+	// Passport holds identity (passport) documents.
+	Passport []DocFile `json:"passport"`
+}
+
+// RegisterBank registers a fiat destination bank account (see BankParams, including
+// the inline proof document) and returns the created account as JSON (with its id,
+// usable as OffRampWithdrawParams.BankAccountID), or an error.
+func (s *OffRampService) RegisterBank(ctx context.Context, p BankParams) (JSON, error) {
+	var out JSON
+	return out, s.c.do(ctx, http.MethodPost, "/v1/offramp/banks", p, nil, &out)
+}
+
+// DeleteBank removes a registered destination bank account. bankAccountID is the
+// account's id (from RegisterBank or Banks). It returns an error if the request is
+// rejected.
+func (s *OffRampService) DeleteBank(ctx context.Context, bankAccountID string) error {
+	return s.c.do(ctx, http.MethodDelete, "/v1/offramp/banks/"+seg(bankAccountID), nil, nil, nil)
+}
+
+// SubmitBankMaterials uploads additional compliance documents for a registered bank
+// account. bankAccountID identifies the account; p carries the certificate/passport
+// documents (see BankMaterialsParams). It returns the updated review state as JSON,
+// or an error.
+func (s *OffRampService) SubmitBankMaterials(ctx context.Context, bankAccountID string, p BankMaterialsParams) (JSON, error) {
+	var out JSON
+	return out, s.c.do(ctx, http.MethodPost, "/v1/offramp/banks/"+seg(bankAccountID)+"/materials", p, nil, &out)
+}
+
 // --- Transactions / unified ledger (scope: ledger:read) ---
 
 // TransactionsService reads the unified ledger across all operation types. Requires
@@ -660,4 +732,77 @@ func (s *TransactionsService) List(ctx context.Context, q TransactionsQuery) (JS
 	}
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/transactions"+qs(m), nil, nil, &out)
+}
+
+// --- Reconciliation (scope: ledger:read) ---
+
+// ReconciliationService reads settlement reconciliation reports that pair each
+// settled payment/withdrawal with its network fee and net amount. Requires the
+// ledger:read scope.
+type ReconciliationService struct{ c *Client }
+
+// ReconciliationQuery filters a reconciliation report by time range and page. All
+// fields are optional; zero values are omitted from the request.
+type ReconciliationQuery struct {
+	// From is the inclusive start of the time range, in epoch milliseconds (0 = unbounded).
+	From int64
+	// To is the inclusive end of the time range, in epoch milliseconds (0 = unbounded).
+	To int64
+	// Limit is the maximum number of rows to return (0 = server default).
+	Limit int
+	// Offset is the number of rows to skip for offset-based pagination.
+	Offset int
+}
+
+// reconQuery renders a ReconciliationQuery to query params (drops zero fields).
+func reconQuery(q ReconciliationQuery) string {
+	m := map[string]string{}
+	if q.From > 0 {
+		m["from"] = strconv.FormatInt(q.From, 10)
+	}
+	if q.To > 0 {
+		m["to"] = strconv.FormatInt(q.To, 10)
+	}
+	if q.Limit > 0 {
+		m["limit"] = strconv.Itoa(q.Limit)
+	}
+	if q.Offset > 0 {
+		m["offset"] = strconv.Itoa(q.Offset)
+	}
+	return qs(m)
+}
+
+// Payments returns the settled pay-in reconciliation report matching q as JSON, or
+// an error. See ReconciliationQuery for the time-range and pagination filters.
+func (s *ReconciliationService) Payments(ctx context.Context, q ReconciliationQuery) (JSON, error) {
+	var out JSON
+	return out, s.c.do(ctx, http.MethodGet, "/v1/reconciliation/payments"+reconQuery(q), nil, nil, &out)
+}
+
+// Withdrawals returns the settled withdrawal/payout reconciliation report matching q
+// as JSON, or an error. See ReconciliationQuery for the time-range and pagination
+// filters.
+func (s *ReconciliationService) Withdrawals(ctx context.Context, q ReconciliationQuery) (JSON, error) {
+	var out JSON
+	return out, s.c.do(ctx, http.MethodGet, "/v1/reconciliation/withdrawals"+reconQuery(q), nil, nil, &out)
+}
+
+// --- Deposits (scope: balances:read) ---
+
+// DepositsService mints on-chain deposit addresses that credit the workspace
+// balance. Requires the balances:read scope.
+type DepositsService struct{ c *Client }
+
+// Chains returns the blockchain networks available for deposits as JSON, or an
+// error. Use a returned chain code with CreateAddress.
+func (s *DepositsService) Chains(ctx context.Context) (JSON, error) {
+	var out JSON
+	return out, s.c.do(ctx, http.MethodGet, "/v1/deposits/chains", nil, nil, &out)
+}
+
+// CreateAddress mints a deposit address on chain (e.g. "TRX", "ETH") that credits
+// the workspace balance. It returns the address details as JSON, or an error.
+func (s *DepositsService) CreateAddress(ctx context.Context, chain string) (JSON, error) {
+	var out JSON
+	return out, s.c.do(ctx, http.MethodPost, "/v1/deposits/address", map[string]string{"chain": chain}, nil, &out)
 }

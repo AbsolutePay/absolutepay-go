@@ -67,6 +67,10 @@ type Client struct {
 	OffRamp *OffRampService
 	// Transactions exposes the unified ledger (scope: ledger:read).
 	Transactions *TransactionsService
+	// Reconciliation exposes settled payment/withdrawal reconciliation reports (scope: ledger:read).
+	Reconciliation *ReconciliationService
+	// Deposits exposes on-chain deposit chains and address minting (scope: balances:read).
+	Deposits *DepositsService
 }
 
 // Option customizes a Client during New. Options are applied in order.
@@ -152,6 +156,8 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 	c.GiftCards = &GiftCardsService{c}
 	c.OffRamp = &OffRampService{c}
 	c.Transactions = &TransactionsService{c}
+	c.Reconciliation = &ReconciliationService{c}
+	c.Deposits = &DepositsService{c}
 	return c, nil
 }
 
