@@ -113,6 +113,34 @@ func TestQueryAndPostBody(t *testing.T) {
 	}
 }
 
+func TestInvoiceRedirectURL(t *testing.T) {
+	// Set: redirectUrl is marshaled into the POST body.
+	c, cap := newStub(t, 201, `{"token":"inv_1"}`)
+	_, err := c.Invoices.CreateCheckout(context.Background(), InvoiceParams{
+		Reference:   "r1",
+		Amount:      Money{Amount: "1.00", Currency: "USDT"},
+		RedirectURL: "https://shop.example.com/thanks",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(cap.body, `"redirectUrl":"https://shop.example.com/thanks"`) {
+		t.Fatalf("redirectUrl not in body: %s", cap.body)
+	}
+
+	// Unset: omitempty drops the field entirely.
+	c2, cap2 := newStub(t, 201, `{"token":"inv_2"}`)
+	_, err = c2.Invoices.Create(context.Background(), InvoiceParams{
+		Reference: "r2", Amount: Money{Amount: "1.00", Currency: "USDT"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(cap2.body, "redirectUrl") {
+		t.Fatalf("redirectUrl should be omitted when empty: %s", cap2.body)
+	}
+}
+
 func TestErrorMapping(t *testing.T) {
 	c, _ := newStub(t, 403, `{"code":"forbidden","title":"requires invoices:read"}`)
 	_, err := c.Invoices.List(context.Background(), PageQuery{})

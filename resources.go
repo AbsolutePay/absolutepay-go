@@ -314,6 +314,11 @@ type InvoiceParams struct {
 	Description string `json:"description,omitempty"`
 	// CustomerEmail is the payer's email, used for receipts/notifications. Optional.
 	CustomerEmail string `json:"customerEmail,omitempty"`
+	// RedirectURL is an http(s) URL the payer's browser is sent to once the hosted
+	// checkout reaches a terminal state. AbsolutePay appends
+	// ?token=<invoiceToken>&status=<SUCCESS|EXPIRED|CANCELED> (preserving any existing
+	// query). Echoed back on the invoice when set. Optional.
+	RedirectURL string `json:"redirectUrl,omitempty"`
 	// ExpiresAt is the expiry time in epoch milliseconds. Optional (0 = no explicit expiry).
 	ExpiresAt int64 `json:"expiresAt,omitempty"`
 	// Chain is the blockchain network. On Create it mints the deposit address up
