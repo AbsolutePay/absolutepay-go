@@ -150,7 +150,7 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 	c.Conversions = &ConversionsService{c}
 	c.Checkouts = &CheckoutsService{c}
 	c.Invoices = &InvoicesService{c}
-	c.Subscriptions = &SubscriptionsService{c}
+	c.Subscriptions = &SubscriptionsService{c: c, Plans: &SubscriptionPlansService{c}}
 	c.GiftCards = &GiftCardsService{c}
 	c.OffRamp = &OffRampService{c}
 	c.Reconciliation = &ReconciliationService{c}

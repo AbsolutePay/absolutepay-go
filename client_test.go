@@ -208,6 +208,37 @@ func TestIdempotencyKeyForwardedAfterSigning(t *testing.T) {
 	}
 }
 
+func TestSubscriptionPlansNested(t *testing.T) {
+	// Create routes to /v1/subscription-plans and honors WithIdempotencyKey.
+	c, cap := newStub(t, 201, `{"merchantPlanNo":"plan_1"}`)
+	_, err := c.Subscriptions.Plans.Create(context.Background(),
+		PlanParams{MerchantPlanNo: "plan_1", Name: "Pro", Amount: Money{Amount: "9.00", Currency: "USDT"}, Interval: "MONTH", IntervalCount: 1},
+		WithIdempotencyKey("plan-001"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap.method != http.MethodPost || cap.path != "/v1/subscription-plans" {
+		t.Fatalf("bad plan create request: %s %s", cap.method, cap.path)
+	}
+	if cap.headers.Get("Idempotency-Key") != "plan-001" {
+		t.Fatalf("idempotency key not forwarded: %q", cap.headers.Get("Idempotency-Key"))
+	}
+
+	// List routes to the same collection.
+	c2, cap2 := newStub(t, 200, `{"items":[{"merchantPlanNo":"plan_1"}],"nextCursor":null}`)
+	page, err := c2.Subscriptions.Plans.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap2.method != http.MethodGet || cap2.path != "/v1/subscription-plans" {
+		t.Fatalf("bad plan list request: %s %s", cap2.method, cap2.path)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("items = %d, want 1", len(page.Items))
+	}
+}
+
 func TestIdempotencyKeyOmitted(t *testing.T) {
 	c, cap := newStub(t, 202, `{}`)
 	_, _ = c.Payouts.Create(context.Background(),

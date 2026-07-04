@@ -363,9 +363,19 @@ func (s *InvoicesService) Delete(ctx context.Context, token string) error {
 
 // --- Subscriptions (scopes: subscriptions:read / subscriptions:write) ---
 
-// SubscriptionsService manages recurring billing plans and subscriptions. Writes
-// require subscriptions:write; reads require subscriptions:read.
-type SubscriptionsService struct{ c *Client }
+// SubscriptionsService manages recurring subscriptions. Reach the plan catalog via
+// the nested Plans sub-service (ap.Subscriptions.Plans). Writes require
+// subscriptions:write; reads require subscriptions:read.
+type SubscriptionsService struct {
+	c *Client
+	// Plans manages the recurring billing plan catalog (ap.Subscriptions.Plans.*).
+	Plans *SubscriptionPlansService
+}
+
+// SubscriptionPlansService manages the recurring billing plan catalog. Reach it via
+// ap.Subscriptions.Plans. Creating a plan requires subscriptions:write; listing
+// requires subscriptions:read.
+type SubscriptionPlansService struct{ c *Client }
 
 // PlanParams defines a recurring billing plan.
 type PlanParams struct {
@@ -393,15 +403,15 @@ type SubscribeParams struct {
 	CallbackURL string `json:"callbackUrl,omitempty"`
 }
 
-// ListPlans returns the workspace's recurring billing plans as a Page (one item per
+// List returns the workspace's recurring billing plans as a Page (one item per
 // plan), or an error.
-func (s *SubscriptionsService) ListPlans(ctx context.Context) (*Page[JSON], error) {
+func (s *SubscriptionPlansService) List(ctx context.Context) (*Page[JSON], error) {
 	return getPage[JSON](ctx, s.c, "/v1/subscription-plans")
 }
 
-// CreatePlan creates a recurring billing plan from p and returns it as JSON, or an
+// Create creates a recurring billing plan from p and returns it as JSON, or an
 // error. Pass WithIdempotencyKey to make retries safe.
-func (s *SubscriptionsService) CreatePlan(ctx context.Context, p PlanParams, opts ...RequestOption) (JSON, error) {
+func (s *SubscriptionPlansService) Create(ctx context.Context, p PlanParams, opts ...RequestOption) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/subscription-plans", p, headersFrom(opts), &out)
 }

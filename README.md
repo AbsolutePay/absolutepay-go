@@ -100,7 +100,7 @@ _ = ap.Checkouts.Delete(ctx, link["token"].(string))
 ## Idempotency
 
 Money-moving POSTs (`Payouts.Create`, `Refunds.Create`, `Conversions.Execute`,
-`OffRamp.Withdraw`, `GiftCards.Create`, `Subscriptions.Create`, `Subscriptions.CreatePlan`)
+`OffRamp.Withdraw`, `GiftCards.Create`, `Subscriptions.Create`, `Subscriptions.Plans.Create`)
 accept `WithIdempotencyKey`, which sets the `Idempotency-Key` header. Replaying with the
 same key returns the original result instead of acting twice; a `409` (in-progress or
 conflicting replay) surfaces as a normal `*absolutepay.Error` you can inspect via `.Code`.
