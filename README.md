@@ -67,6 +67,23 @@ func main() {
 }
 ```
 
+## Hosted checkout link
+
+For a hosted page where the payer picks the asset and network at pay time, create a
+checkout link and redirect the customer to its `checkoutUrl`. Confirm payment via the
+`payment.succeeded` webhook or by polling `ap.Invoices.Public.Status(ctx, token)`.
+
+```go
+link, err := ap.Invoices.CreateCheckout(ctx, absolutepay.InvoiceParams{
+	Reference: "order-123",
+	Amount:    absolutepay.Money{Amount: "25.00", Currency: "USDT"},
+})
+if err != nil {
+	log.Fatal(err)
+}
+fmt.Println(link["checkoutUrl"]) // send the payer here; they choose how to pay
+```
+
 ## Errors
 
 Non-2xx responses return an `*absolutepay.Error`:

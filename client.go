@@ -49,8 +49,6 @@ type Client struct {
 	Balances *BalancesService
 	// Fees exposes fee previews (scope: balances:read).
 	Fees *FeesService
-	// Payments exposes pay-in checkout orders (scope: payments:write).
-	Payments *PaymentsService
 	// Payouts exposes batch on-chain payouts (scopes: payouts:write / payouts:read).
 	Payouts *PayoutsService
 	// Refunds exposes refunds against checkout orders (scope: payments:write).
@@ -147,7 +145,6 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 
 	c.Balances = &BalancesService{c}
 	c.Fees = &FeesService{c}
-	c.Payments = &PaymentsService{c}
 	c.Payouts = &PayoutsService{c}
 	c.Refunds = &RefundsService{c}
 	c.Conversions = &ConversionsService{c}
