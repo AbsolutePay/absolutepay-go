@@ -339,47 +339,9 @@ func (s *InvoicesService) Void(ctx context.Context, token string) (JSON, error) 
 // invoice token shown to the payer.
 type PublicInvoicesService struct{ c *Client }
 
-// Get returns the public view of an invoice by token as JSON, or an error.
-func (s *PublicInvoicesService) Get(ctx context.Context, token string) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/public/invoices/"+seg(token), nil, nil, &out)
-}
-
-// Assets lists the assets/networks the payer can use to pay the invoice identified
-// by token. It returns one JSON object per payable asset, or an error.
-func (s *PublicInvoicesService) Assets(ctx context.Context, token string) ([]JSON, error) {
-	var out []JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/public/invoices/"+seg(token)+"/assets", nil, nil, &out)
-}
-
-// DepositParams selects the asset for a hosted-invoice deposit.
-type DepositParams struct {
-	// Currency is the asset code the payer chose, e.g. "USDT".
-	Currency string `json:"currency"`
-	// Chain is the blockchain network for the deposit, e.g. "TRX".
-	Chain string `json:"chain"`
-	// FullCurrType is the provider's fully-qualified currency/network identifier
-	// (as returned by Assets).
-	FullCurrType string `json:"fullCurrType"`
-}
-
-// Deposit selects an asset for the invoice identified by token and returns the
-// deposit instructions (address/amount) as JSON, or an error.
-func (s *PublicInvoicesService) Deposit(ctx context.Context, token string, p DepositParams) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodPost, "/v1/public/invoices/"+seg(token)+"/deposit", p, nil, &out)
-}
-
-// Quote returns the amount of currency required to pay the invoice identified by
-// token. currency is the asset code the payer wants to pay in. It returns the quote
-// as JSON, or an error.
-func (s *PublicInvoicesService) Quote(ctx context.Context, token, currency string) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodPost, "/v1/public/invoices/"+seg(token)+"/quote", map[string]string{"currency": currency}, nil, &out)
-}
-
 // Status returns the current payment status of the invoice identified by token as
-// JSON, or an error. Poll this from the payer-facing page.
+// JSON, or an error. Use it as a settlement-confirmation fallback alongside the
+// payment.succeeded webhook (e.g. poll after the payer returns from hosted checkout).
 func (s *PublicInvoicesService) Status(ctx context.Context, token string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodGet, "/v1/public/invoices/"+seg(token)+"/status", nil, nil, &out)
