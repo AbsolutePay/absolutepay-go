@@ -56,9 +56,10 @@ func main() {
 	fmt.Println(balances)
 
 	inv, err := ap.Invoices.Create(ctx, absolutepay.InvoiceParams{
-		Reference: "order-123",
-		Amount:    absolutepay.Money{Amount: "25.00", Currency: "USDT"},
-		Chain:     "MATIC", // mint the deposit address up front; omit to let the payer pick
+		Reference:   "order-123",
+		Amount:      absolutepay.Money{Amount: "25.00", Currency: "USDT"},
+		Chain:       "MATIC", // mint the deposit address up front; omit to let the payer pick
+		RedirectURL: "https://shop.example.com/thanks", // payer returns here after checkout (?token=…&status=…)
 	})
 	if err != nil {
 		log.Fatal(err)
