@@ -74,56 +74,6 @@ func (s *FeesService) Preview(ctx context.Context, amount, currency string, paym
 	return &out, s.c.do(ctx, http.MethodGet, "/v1/fees/preview"+q, nil, nil, &out)
 }
 
-// --- Payments (scope: payments:write) ---
-
-// PaymentsService creates and looks up pay-in checkout orders. Requires the
-// payments:write scope.
-type PaymentsService struct{ c *Client }
-
-// CheckoutParams is the request body for CreateCheckout.
-type CheckoutParams struct {
-	// MerchantTradeNo is your unique order reference. Optional: the server generates
-	// one when omitted. Use it later with GetCheckout.
-	MerchantTradeNo string `json:"merchantTradeNo,omitempty"`
-	// Amount is the order amount and currency to charge.
-	Amount Money `json:"amount"`
-	// Chain is the blockchain network for the pay-in, e.g. "TRX", "ETH".
-	Chain string `json:"chain"`
-	// MerchantUserID is your identifier for the paying customer.
-	MerchantUserID int64 `json:"merchantUserId"`
-	// GoodsName is a human-readable description of what is being purchased.
-	GoodsName string `json:"goodsName"`
-	// TerminalType is the checkout surface, e.g. "WEB" or "APP". Optional.
-	TerminalType string `json:"terminalType,omitempty"`
-	// ExpiresIn is the order lifetime in seconds before it expires. Optional (0 = server default).
-	ExpiresIn int `json:"expiresIn,omitempty"`
-	// Method is the payment method hint. Optional.
-	Method string `json:"method,omitempty"`
-}
-
-// CreateCheckout creates a pay-in order (the customer pays the merchant) and
-// returns the order details as JSON (order id, pay URL/address, status, etc.).
-// It returns an error if the request is rejected. Example:
-//
-//	order, err := ap.Payments.CreateCheckout(ctx, absolutepay.CheckoutParams{
-//		Amount:         absolutepay.Money{Amount: "10.00", Currency: "USDT"},
-//		Chain:          "TRX",
-//		MerchantUserID: 42,
-//		GoodsName:      "Pro plan",
-//	})
-func (s *PaymentsService) CreateCheckout(ctx context.Context, p CheckoutParams) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodPost, "/v1/checkout", p, nil, &out)
-}
-
-// GetCheckout looks up a checkout order by its merchant trade number.
-// merchantTradeNo is the reference from CheckoutParams (or the server-generated
-// one). It returns the order state as JSON, or an error.
-func (s *PaymentsService) GetCheckout(ctx context.Context, merchantTradeNo string) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/checkout/"+seg(merchantTradeNo), nil, nil, &out)
-}
-
 // --- Payouts (scopes: payouts:write / payouts:read) ---
 
 // PayoutsService sends batch on-chain payouts and reads their status. Creating a
