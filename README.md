@@ -58,24 +58,31 @@ func main() {
 	inv, err := ap.Invoices.Create(ctx, absolutepay.InvoiceParams{
 		Reference:   "order-123",
 		Amount:      absolutepay.Money{Amount: "25.00", Currency: "USDT"},
-		Chain:       "MATIC", // mint the deposit address up front; omit to let the payer pick
+		Chain:       "MATIC", // REQUIRED — mints the deposit address up front
 		RedirectURL: "https://shop.example.com/thanks", // payer returns here after checkout (?token=…&status=…)
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(inv["token"])
+	fmt.Println(inv["token"], inv["address"])
 }
 ```
 
-## Hosted checkout link
+## Checkouts vs. invoices
 
-For a hosted page where the payer picks the asset and network at pay time, create a
-checkout link and redirect the customer to its `checkoutUrl`. Confirm payment via the
-`payment.succeeded` webhook or by polling `ap.Invoices.Public.Status(ctx, token)`.
+Two symmetric resources create a payable link:
+
+- **`ap.Checkouts`** — a hosted page where the payer picks the asset **and** network at
+  pay time. No `chain`; you get a `checkoutUrl` to redirect the customer to.
+- **`ap.Invoices`** — an up-front flow: you pass a **required `chain`** and get a fixed
+  deposit `address` back immediately.
+
+Both expose the same lifecycle: `Create` / `List` / `Get` / `Update` / `Delete`.
+`Update` pauses/resumes or edits the link; `Delete` voids it. Confirm payment via the
+`payment.succeeded` webhook or by polling `Get(ctx, token)`.
 
 ```go
-link, err := ap.Invoices.CreateCheckout(ctx, absolutepay.InvoiceParams{
+link, err := ap.Checkouts.Create(ctx, absolutepay.CheckoutParams{
 	Reference: "order-123",
 	Amount:    absolutepay.Money{Amount: "25.00", Currency: "USDT"},
 })
@@ -83,6 +90,26 @@ if err != nil {
 	log.Fatal(err)
 }
 fmt.Println(link["checkoutUrl"]) // send the payer here; they choose how to pay
+
+// Pause the link, then void it.
+paused := true
+_, _ = ap.Checkouts.Update(ctx, link["token"].(string), absolutepay.ResourceUpdate{Paused: &paused})
+_ = ap.Checkouts.Delete(ctx, link["token"].(string))
+```
+
+## Idempotency
+
+Money-moving POSTs (`Payouts.Create`, `Refunds.Create`, `Conversions.Execute`,
+`OffRamp.Withdraw`, `GiftCards.Create`, `Subscriptions.Create`, `Subscriptions.CreatePlan`)
+accept `WithIdempotencyKey`, which sets the `Idempotency-Key` header. Replaying with the
+same key returns the original result instead of acting twice; a `409` (in-progress or
+conflicting replay) surfaces as a normal `*absolutepay.Error` you can inspect via `.Code`.
+
+```go
+_, err := ap.Refunds.Create(ctx, absolutepay.RefundParams{
+	MerchantTradeNo: "order-123",
+	Amount:          absolutepay.Money{Amount: "10.00", Currency: "USDT"},
+}, absolutepay.WithIdempotencyKey("refund-order-123-1"))
 ```
 
 ## Errors
@@ -101,22 +128,31 @@ if errors.As(err, &apErr) {
 
 ## Pagination
 
-Live lists use keyset pagination. Pass a prior page's `NextCursor` as `PageQuery.Before`; it's `nil` on the last page.
+Lists return a generic `Page[T]` with `{ Items, NextCursor }` (the ledger lists —
+`Refunds.List`, `Conversions.List` — and reconciliation also carry `Total`). Pass a
+prior page's `NextCursor` back as the query's `Before`; it is `""` on the last page.
+Loosely-typed lists come back as `Page[JSON]` (`JSON` = `map[string]any`); read fields
+by key.
 
 ```go
 var before string
 for {
-	page, err := ap.Invoices.List(ctx, absolutepay.PageQuery{Limit: 50, Before: before})
+	page, err := ap.Invoices.List(ctx, absolutepay.ListQuery{
+		Limit:  50,
+		Before: before,
+		Order:  absolutepay.OrderDesc,
+		Status: "OPEN", // optional filter
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	for _, raw := range page.Items {
-		// json.Unmarshal(raw, &yourType)
+	for _, item := range page.Items {
+		fmt.Println(item["token"], item["amount"])
 	}
-	if page.NextCursor == nil {
+	if page.NextCursor == "" {
 		break
 	}
-	before = *page.NextCursor
+	before = page.NextCursor
 }
 ```
 
@@ -145,7 +181,7 @@ The freshness (replay) window defaults to 5 minutes; pass `absolutepay.WithToler
 
 - **Server-side only.** The API key + signing secret authenticate as your workspace.
 - Requests go over HTTPS only (except `localhost` for local development).
-- The `Idempotency-Key` header (on payouts) is intentionally **not** part of the signed canonical string.
+- The `Idempotency-Key` header (on money POSTs) is intentionally **not** part of the signed canonical string.
 
 ## License
 

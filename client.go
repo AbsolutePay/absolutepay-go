@@ -51,11 +51,13 @@ type Client struct {
 	Fees *FeesService
 	// Payouts exposes batch on-chain payouts (scopes: payouts:write / payouts:read).
 	Payouts *PayoutsService
-	// Refunds exposes refunds against checkout orders (scope: payments:write).
+	// Refunds exposes refunds and the settled refund ledger (scopes: payments:write / ledger:read).
 	Refunds *RefundsService
-	// Conversions exposes currency conversions (scope: convert:write).
+	// Conversions exposes currency conversions and the settled convert ledger (scopes: convert:write / ledger:read).
 	Conversions *ConversionsService
-	// Invoices exposes invoices and hosted payment links (scopes: invoices:write / invoices:read).
+	// Checkouts exposes hosted checkout links where the payer picks asset + network (scopes: invoices:write / invoices:read).
+	Checkouts *CheckoutsService
+	// Invoices exposes up-front fixed-address invoices (scopes: invoices:write / invoices:read).
 	Invoices *InvoicesService
 	// Subscriptions exposes recurring plans and subscriptions (scopes: subscriptions:write / subscriptions:read).
 	Subscriptions *SubscriptionsService
@@ -63,11 +65,9 @@ type Client struct {
 	GiftCards *GiftCardsService
 	// OffRamp exposes crypto-to-fiat off-ramp (scopes: payouts:write / payouts:read).
 	OffRamp *OffRampService
-	// Transactions exposes the unified ledger (scope: ledger:read).
-	Transactions *TransactionsService
 	// Reconciliation exposes settled payment/withdrawal reconciliation reports (scope: ledger:read).
 	Reconciliation *ReconciliationService
-	// Deposits exposes on-chain deposit chains and address minting (scope: balances:read).
+	// Deposits exposes deposit chains, own-balance receive addresses, and history (scope: balances:read).
 	Deposits *DepositsService
 }
 
@@ -148,14 +148,24 @@ func New(apiKey string, opts ...Option) (*Client, error) {
 	c.Payouts = &PayoutsService{c}
 	c.Refunds = &RefundsService{c}
 	c.Conversions = &ConversionsService{c}
-	c.Invoices = &InvoicesService{c, &PublicInvoicesService{c}}
+	c.Checkouts = &CheckoutsService{c}
+	c.Invoices = &InvoicesService{c}
 	c.Subscriptions = &SubscriptionsService{c}
 	c.GiftCards = &GiftCardsService{c}
 	c.OffRamp = &OffRampService{c}
-	c.Transactions = &TransactionsService{c}
 	c.Reconciliation = &ReconciliationService{c}
 	c.Deposits = &DepositsService{c}
 	return c, nil
+}
+
+// getPage GETs a cursor-paginated list into a Page[T]. It is a package-level
+// generic helper because Go methods cannot carry their own type parameters.
+func getPage[T any](ctx context.Context, c *Client, path string) (*Page[T], error) {
+	var out Page[T]
+	if err := c.do(ctx, http.MethodGet, path, nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // do performs a request. path is the path+query. body is JSON-marshaled (nil for
@@ -241,13 +251,18 @@ func qs(params map[string]string) string {
 	return "?" + v.Encode()
 }
 
-// pageQuery renders a PageQuery to query params (drops zero/empty fields).
-func pageQuery(p PageQuery) string {
-	m := map[string]string{"before": p.Before, "status": p.Status}
-	if p.Limit > 0 {
-		m["limit"] = strconv.Itoa(p.Limit)
+// putInt adds an int query field to m only when it is positive (0 = omit).
+func putInt(m map[string]string, k string, v int) {
+	if v > 0 {
+		m[k] = strconv.Itoa(v)
 	}
-	return qs(m)
+}
+
+// putInt64 adds an int64 query field to m only when it is positive (0 = omit).
+func putInt64(m map[string]string, k string, v int64) {
+	if v > 0 {
+		m[k] = strconv.FormatInt(v, 10)
+	}
 }
 
 func min(a, b int) int {
