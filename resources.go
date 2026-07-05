@@ -4,12 +4,11 @@ import (
 	"context"
 	"net/http"
 	"net/url"
-	"strconv"
 )
 
 // JSON is a loosely-typed object returned by endpoints that have no dedicated
 // response struct. It is an alias for map[string]any; read fields by key, e.g.
-// resp["orderId"]. Values follow encoding/json defaults (numbers decode to float64).
+// resp["token"]. Values follow encoding/json defaults (numbers decode to float64).
 type JSON = map[string]any
 
 // RequestOption sets per-request extras such as an idempotency key. The resulting
@@ -17,8 +16,9 @@ type JSON = map[string]any
 // canonical string.
 type RequestOption func(map[string]string)
 
-// WithIdempotencyKey makes a write retry-safe: replaying a request with the same
-// key returns the original result instead of performing the action twice. key is a
+// WithIdempotencyKey makes a money-moving POST retry-safe: replaying a request with
+// the same key returns the original result instead of performing the action twice
+// (a 409 surfaces an in-progress/conflicting replay as a normal *Error). key is a
 // caller-chosen unique string (e.g. a UUID) that you reuse across retries of the
 // same logical operation.
 func WithIdempotencyKey(key string) RequestOption {
@@ -43,19 +43,10 @@ func seg(s string) string { return url.PathEscape(s) }
 // BalancesService reads workspace asset balances. Requires the balances:read scope.
 type BalancesService struct{ c *Client }
 
-// List returns every asset balance for the workspace. ctx controls
-// cancellation/deadline. It returns one Balance per asset, or an error.
-func (s *BalancesService) List(ctx context.Context) ([]Balance, error) {
-	var out []Balance
-	return out, s.c.do(ctx, http.MethodGet, "/v1/balances", nil, nil, &out)
-}
-
-// Summary values the whole balance in a single quote currency. quote is the
-// currency code to value in (e.g. "USDT"); pass "" to use the server default
-// (USDT). It returns a loosely-typed JSON summary, or an error.
-func (s *BalancesService) Summary(ctx context.Context, quote string) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/balances/summary"+qs(map[string]string{"quote": quote}), nil, nil, &out)
+// List returns every asset balance for the workspace as a Page[Balance] (one item
+// per asset; the list is not cursor-paged, so NextCursor is empty), or an error.
+func (s *BalancesService) List(ctx context.Context) (*Page[Balance], error) {
+	return getPage[Balance](ctx, s.c, "/v1/balances")
 }
 
 // --- Fees (scope: balances:read) ---
@@ -111,11 +102,10 @@ func (s *PayoutsService) Create(ctx context.Context, items []PayoutItem, opts ..
 }
 
 // Options lists the supported chains plus the per-chain withdraw fee and limits for
-// a currency. currency is the asset code (e.g. "USDT"). It returns the options as
-// JSON, or an error.
-func (s *PayoutsService) Options(ctx context.Context, currency string) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/payouts/options"+qs(map[string]string{"currency": currency}), nil, nil, &out)
+// a currency, as a Page (one item per chain option). currency is the asset code
+// (e.g. "USDT"). It returns the options, or an error.
+func (s *PayoutsService) Options(ctx context.Context, currency string) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/payouts/options"+qs(map[string]string{"currency": currency}))
 }
 
 // Get looks up a payout batch by its id and returns its status as JSON, or an error.
@@ -124,10 +114,10 @@ func (s *PayoutsService) Get(ctx context.Context, id string) (JSON, error) {
 	return out, s.c.do(ctx, http.MethodGet, "/v1/payouts/"+seg(id), nil, nil, &out)
 }
 
-// --- Refunds (scope: payments:write) ---
+// --- Refunds (scopes: payments:write to issue, ledger:read to list/get) ---
 
-// RefundsService issues and looks up refunds against checkout orders. Requires the
-// payments:write scope.
+// RefundsService issues refunds against settled checkout orders and reads the
+// settled refund ledger. Issuing requires payments:write; reads require ledger:read.
 type RefundsService struct{ c *Client }
 
 // RefundParams is the request body for Create.
@@ -141,16 +131,17 @@ type RefundParams struct {
 }
 
 // Create issues a refund against a settled checkout order and returns the refund
-// details as JSON (including a refundRequestId), or an error. Example:
+// details as JSON (including a refundRequestId), or an error. Pass
+// WithIdempotencyKey to make retries safe. Example:
 //
 //	refund, err := ap.Refunds.Create(ctx, absolutepay.RefundParams{
 //		MerchantTradeNo: "order-123",
 //		Amount:          absolutepay.Money{Amount: "10.00", Currency: "USDT"},
 //		Reason:          "customer request",
-//	})
-func (s *RefundsService) Create(ctx context.Context, p RefundParams) (JSON, error) {
+//	}, absolutepay.WithIdempotencyKey("refund-order-123-1"))
+func (s *RefundsService) Create(ctx context.Context, p RefundParams, opts ...RequestOption) (JSON, error) {
 	var out JSON
-	return out, s.c.do(ctx, http.MethodPost, "/v1/refunds", p, nil, &out)
+	return out, s.c.do(ctx, http.MethodPost, "/v1/refunds", p, headersFrom(opts), &out)
 }
 
 // Get looks up a refund by its refundRequestId and returns its status as JSON, or
@@ -160,10 +151,18 @@ func (s *RefundsService) Get(ctx context.Context, id string) (JSON, error) {
 	return out, s.c.do(ctx, http.MethodGet, "/v1/refunds/"+seg(id), nil, nil, &out)
 }
 
-// --- Conversions (scope: convert:write) ---
+// List returns a cursor-paginated page of the settled REFUND ledger history (the
+// page carries Total, the true count for the filtered range). q filters by time
+// range/currency and pages; pass a prior Page.NextCursor as q.Before for the next
+// page ("" means the last page). See LedgerQuery.
+func (s *RefundsService) List(ctx context.Context, q LedgerQuery) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/refunds"+qs(q.values()))
+}
 
-// ConversionsService quotes and executes currency conversions. Requires the
-// convert:write scope.
+// --- Conversions (scopes: convert:write to execute, ledger:read to list) ---
+
+// ConversionsService quotes and executes currency conversions and reads the settled
+// convert ledger. Quoting/executing require convert:write; List requires ledger:read.
 type ConversionsService struct{ c *Client }
 
 // QuoteParams requests a conversion quote. Set exactly one of SellAmount or
@@ -214,49 +213,28 @@ func (s *ConversionsService) Quote(ctx context.Context, p QuoteParams) (*Convert
 }
 
 // Execute runs a previously quoted conversion (this moves funds) and returns the
-// result as JSON, or an error.
-func (s *ConversionsService) Execute(ctx context.Context, p ConvertExecuteParams) (JSON, error) {
+// result as JSON, or an error. Pass WithIdempotencyKey to make retries safe.
+func (s *ConversionsService) Execute(ctx context.Context, p ConvertExecuteParams, opts ...RequestOption) (JSON, error) {
 	var out JSON
-	return out, s.c.do(ctx, http.MethodPost, "/v1/conversions", p, nil, &out)
+	return out, s.c.do(ctx, http.MethodPost, "/v1/conversions", p, headersFrom(opts), &out)
 }
 
-// Convert quotes then immediately executes a conversion in one call — a convenience
-// wrapper over Quote + Execute. p describes the legs (see QuoteParams). It returns
-// the executed conversion as JSON, or an error from either step. Example:
-//
-//	res, err := ap.Conversions.Convert(ctx, absolutepay.QuoteParams{
-//		SellCurrency: "USDT",
-//		BuyCurrency:  "BTC",
-//		SellAmount:   "100.00",
-//	})
-func (s *ConversionsService) Convert(ctx context.Context, p QuoteParams) (JSON, error) {
-	q, err := s.Quote(ctx, p)
-	if err != nil {
-		return nil, err
-	}
-	return s.Execute(ctx, ConvertExecuteParams{
-		QuoteID: q.QuoteID,
-		Sell:    Money{Amount: q.SellAmount, Currency: q.SellCurrency},
-		Buy:     Money{Amount: q.BuyAmount, Currency: q.BuyCurrency},
-	})
+// List returns a cursor-paginated page of the settled CONVERT ledger history (the
+// page carries Total, the true count for the filtered range). See LedgerQuery.
+func (s *ConversionsService) List(ctx context.Context, q LedgerQuery) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/conversions"+qs(q.values()))
 }
 
-// --- Invoices + hosted payment links (scopes: invoices:write / invoices:read) ---
+// --- Checkouts (scopes: invoices:write / invoices:read) ---
 
-// InvoicesService creates and manages invoices and hosted payment links. Writes
-// require invoices:write; reads require invoices:read. Payer-facing endpoints that
-// need no API key live under Public.
-type InvoicesService struct {
-	c *Client
-	// Public holds the unauthenticated, payer-facing invoice endpoints.
-	Public *PublicInvoicesService
-}
+// CheckoutsService creates and manages hosted checkout links, where the payer picks
+// the asset and network at pay time. Writes require invoices:write; reads require
+// invoices:read.
+type CheckoutsService struct{ c *Client }
 
-// InvoiceParams is the request body for Create and CreateCheckout. On Create, set
-// Chain to mint the deposit address up front; CreateCheckout ignores Chain and lets
-// the payer choose the network.
-type InvoiceParams struct {
-	// Reference is your unique invoice reference.
+// CheckoutParams is the request body for CheckoutsService.Create.
+type CheckoutParams struct {
+	// Reference is your unique checkout reference.
 	Reference string `json:"reference"`
 	// Amount is the amount and currency to bill.
 	Amount Money `json:"amount"`
@@ -264,101 +242,140 @@ type InvoiceParams struct {
 	Description string `json:"description,omitempty"`
 	// CustomerEmail is the payer's email, used for receipts/notifications. Optional.
 	CustomerEmail string `json:"customerEmail,omitempty"`
-	// RedirectURL is an http(s) URL the payer's browser is sent to once the hosted
-	// checkout reaches a terminal state. AbsolutePay appends
-	// ?token=<invoiceToken>&status=<SUCCESS|EXPIRED|CANCELED> (preserving any existing
-	// query). Echoed back on the invoice when set. Optional.
-	RedirectURL string `json:"redirectUrl,omitempty"`
 	// ExpiresAt is the expiry time in epoch milliseconds. Optional (0 = no explicit expiry).
 	ExpiresAt int64 `json:"expiresAt,omitempty"`
-	// Chain is the blockchain network. On Create it mints the deposit address up
-	// front; ignored by CreateCheckout. Optional.
-	Chain string `json:"chain,omitempty"`
+	// RedirectURL is an http(s) URL the payer's browser is sent to once the hosted
+	// checkout reaches a terminal state. AbsolutePay appends
+	// ?token=<token>&status=<SUCCESS|EXPIRED|CANCELED> (preserving any existing query).
+	// Optional.
+	RedirectURL string `json:"redirectUrl,omitempty"`
 }
 
-// Create creates a fixed-asset invoice and returns it as JSON (including its token
-// and, if Chain was set, a deposit address), or an error.
+// ResourceUpdate patches an open checkout or invoice. Only set fields are sent; a
+// pointer left nil is omitted. To explicitly clear RedirectURL/Description, send an
+// empty string; to change Paused, set the pointer.
+type ResourceUpdate struct {
+	// Paused pauses (true) or resumes (false) the link. nil leaves it unchanged.
+	Paused *bool `json:"paused,omitempty"`
+	// RedirectURL replaces the post-checkout redirect URL. nil leaves it unchanged.
+	RedirectURL *string `json:"redirectUrl,omitempty"`
+	// ExpiresAt replaces the expiry (epoch ms). nil leaves it unchanged.
+	ExpiresAt *int64 `json:"expiresAt,omitempty"`
+	// Description replaces the description. nil leaves it unchanged.
+	Description *string `json:"description,omitempty"`
+}
+
+// Create creates a hosted checkout link and returns it as JSON (including token and
+// checkoutUrl — send the payer to checkoutUrl). It returns an error if rejected.
+func (s *CheckoutsService) Create(ctx context.Context, p CheckoutParams) (JSON, error) {
+	var out JSON
+	return out, s.c.do(ctx, http.MethodPost, "/v1/checkouts", p, nil, &out)
+}
+
+// List returns a cursor-paginated page of checkout links. q sets page size, cursor,
+// order, and optional status/search filters; pass a prior Page.NextCursor as
+// q.Before ("" means the last page). See ListQuery.
+func (s *CheckoutsService) List(ctx context.Context, q ListQuery) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/checkouts"+qs(q.values()))
+}
+
+// Get looks up a checkout link by its token and returns it as JSON, or an error.
+// Use it as a settlement-confirmation fallback alongside the payment.succeeded
+// webhook.
+func (s *CheckoutsService) Get(ctx context.Context, token string) (JSON, error) {
+	var out JSON
+	return out, s.c.do(ctx, http.MethodGet, "/v1/checkouts/"+seg(token), nil, nil, &out)
+}
+
+// Update patches an open checkout link (pause/resume, redirect, expiry,
+// description) and returns the updated state as JSON, or an error. See ResourceUpdate.
+func (s *CheckoutsService) Update(ctx context.Context, token string, patch ResourceUpdate) (JSON, error) {
+	var out JSON
+	return out, s.c.do(ctx, http.MethodPatch, "/v1/checkouts/"+seg(token), patch, nil, &out)
+}
+
+// Delete voids a checkout link, making it permanently unpayable. token identifies
+// the link. It returns an error if the request is rejected.
+func (s *CheckoutsService) Delete(ctx context.Context, token string) error {
+	return s.c.do(ctx, http.MethodDelete, "/v1/checkouts/"+seg(token), nil, nil, nil)
+}
+
+// --- Invoices (scopes: invoices:write / invoices:read) ---
+
+// InvoicesService creates and manages up-front invoices: the deposit address is
+// minted at create time on a fixed Chain. Writes require invoices:write; reads
+// require invoices:read.
+type InvoicesService struct{ c *Client }
+
+// InvoiceParams is the request body for InvoicesService.Create. Chain is REQUIRED —
+// it mints the deposit address up front. For a payer-picks-the-network flow, use
+// CheckoutsService instead.
+type InvoiceParams struct {
+	// Reference is your unique invoice reference.
+	Reference string `json:"reference"`
+	// Amount is the amount and currency to bill.
+	Amount Money `json:"amount"`
+	// Chain is the blockchain network; REQUIRED. It mints the deposit address up front.
+	Chain string `json:"chain"`
+	// Description is an optional human-readable line item / memo.
+	Description string `json:"description,omitempty"`
+	// CustomerEmail is the payer's email, used for receipts/notifications. Optional.
+	CustomerEmail string `json:"customerEmail,omitempty"`
+	// ExpiresAt is the expiry time in epoch milliseconds. Optional (0 = no explicit expiry).
+	ExpiresAt int64 `json:"expiresAt,omitempty"`
+	// RedirectURL is an http(s) URL the payer's browser returns to at a terminal
+	// state (?token=…&status=…). Optional.
+	RedirectURL string `json:"redirectUrl,omitempty"`
+}
+
+// Create creates a fixed-asset invoice (Chain required) and returns it as JSON
+// (including its token, address, chain, and amount), or an error.
 func (s *InvoicesService) Create(ctx context.Context, p InvoiceParams) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/invoices", p, nil, &out)
 }
 
-// CreateCheckout creates a hosted checkout link where the payer picks the asset and
-// network at pay time. Any Chain in p is cleared. It returns the link as JSON
-// (including its token/URL), or an error.
-func (s *InvoicesService) CreateCheckout(ctx context.Context, p InvoiceParams) (JSON, error) {
-	p.Chain = "" // checkout links let the payer choose the network
+// List returns a cursor-paginated page of invoices. q sets page size, cursor,
+// order, and optional status/search filters; pass a prior Page.NextCursor as
+// q.Before ("" means the last page). See ListQuery.
+func (s *InvoicesService) List(ctx context.Context, q ListQuery) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/invoices"+qs(q.values()))
+}
+
+// Get looks up an invoice by its token and returns it as JSON, or an error.
+func (s *InvoicesService) Get(ctx context.Context, token string) (JSON, error) {
 	var out JSON
-	return out, s.c.do(ctx, http.MethodPost, "/v1/checkouts", p, nil, &out)
+	return out, s.c.do(ctx, http.MethodGet, "/v1/invoices/"+seg(token), nil, nil, &out)
 }
 
-// List returns a keyset-paginated page of invoices. q sets the page size, cursor,
-// and optional status filter (see PageQuery). Pass a prior page's Page.NextCursor
-// as q.Before for the next page; NextCursor is nil on the last page. Example:
-//
-//	q := absolutepay.PageQuery{Limit: 50}
-//	for {
-//		page, err := ap.Invoices.List(ctx, q)
-//		if err != nil {
-//			return err
-//		}
-//		// ... process page.Items ...
-//		if page.NextCursor == nil {
-//			break
-//		}
-//		q.Before = *page.NextCursor
-//	}
-func (s *InvoicesService) List(ctx context.Context, q PageQuery) (*Page, error) {
-	var out Page
-	return &out, s.c.do(ctx, http.MethodGet, "/v1/invoices"+pageQuery(q), nil, nil, &out)
-}
-
-// Stats returns aggregate invoice statistics for the workspace as JSON, or an error.
-func (s *InvoicesService) Stats(ctx context.Context) (JSON, error) {
+// Update patches an open invoice (pause/resume, redirect, expiry, description) and
+// returns the updated state as JSON, or an error. See ResourceUpdate.
+func (s *InvoicesService) Update(ctx context.Context, token string, patch ResourceUpdate) (JSON, error) {
 	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/invoices/stats", nil, nil, &out)
+	return out, s.c.do(ctx, http.MethodPatch, "/v1/invoices/"+seg(token), patch, nil, &out)
 }
 
-// Pause pauses or unpauses an open invoice or payment link. token identifies the
-// invoice; paused=true pauses it and paused=false resumes it. It returns the
-// updated state as JSON, or an error.
-func (s *InvoicesService) Pause(ctx context.Context, token string, paused bool) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodPost, "/v1/invoices/"+seg(token)+"/pause", map[string]bool{"paused": paused}, nil, &out)
-}
-
-// Void makes an invoice or payment link permanently unpayable. token identifies the
-// invoice. It returns the updated state as JSON, or an error.
-func (s *InvoicesService) Void(ctx context.Context, token string) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodPost, "/v1/invoices/"+seg(token)+"/void", nil, nil, &out)
-}
-
-// PublicInvoicesService holds the unauthenticated, payer-facing invoice endpoints
-// (no API key required). Reach it via InvoicesService.Public. token is the public
-// invoice token shown to the payer.
-type PublicInvoicesService struct{ c *Client }
-
-// Status returns the current payment status of the invoice identified by token as
-// JSON, or an error. Use it as a settlement-confirmation fallback alongside the
-// payment.succeeded webhook (e.g. poll after the payer returns from hosted checkout).
-func (s *PublicInvoicesService) Status(ctx context.Context, token string) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/public/invoices/"+seg(token)+"/status", nil, nil, &out)
-}
-
-// TrackOpen records that the payer opened the hosted invoice identified by token
-// (an analytics/engagement signal). It sends no body and ignores the response,
-// returning only an error if the request is rejected.
-func (s *PublicInvoicesService) TrackOpen(ctx context.Context, token string) error {
-	return s.c.do(ctx, http.MethodPost, "/v1/public/invoices/"+seg(token)+"/open", nil, nil, nil)
+// Delete voids an invoice, making it permanently unpayable. token identifies the
+// invoice. It returns an error if the request is rejected.
+func (s *InvoicesService) Delete(ctx context.Context, token string) error {
+	return s.c.do(ctx, http.MethodDelete, "/v1/invoices/"+seg(token), nil, nil, nil)
 }
 
 // --- Subscriptions (scopes: subscriptions:read / subscriptions:write) ---
 
-// SubscriptionsService manages recurring billing plans and subscriptions. Writes
-// require subscriptions:write; reads require subscriptions:read.
-type SubscriptionsService struct{ c *Client }
+// SubscriptionsService manages recurring subscriptions. Reach the plan catalog via
+// the nested Plans sub-service (ap.Subscriptions.Plans). Writes require
+// subscriptions:write; reads require subscriptions:read.
+type SubscriptionsService struct {
+	c *Client
+	// Plans manages the recurring billing plan catalog (ap.Subscriptions.Plans.*).
+	Plans *SubscriptionPlansService
+}
+
+// SubscriptionPlansService manages the recurring billing plan catalog. Reach it via
+// ap.Subscriptions.Plans. Creating a plan requires subscriptions:write; listing
+// requires subscriptions:read.
+type SubscriptionPlansService struct{ c *Client }
 
 // PlanParams defines a recurring billing plan.
 type PlanParams struct {
@@ -386,40 +403,38 @@ type SubscribeParams struct {
 	CallbackURL string `json:"callbackUrl,omitempty"`
 }
 
-// ListPlans returns the workspace's recurring billing plans as JSON, or an error.
-func (s *SubscriptionsService) ListPlans(ctx context.Context) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/subscription-plans", nil, nil, &out)
+// List returns the workspace's recurring billing plans as a Page (one item per
+// plan), or an error.
+func (s *SubscriptionPlansService) List(ctx context.Context) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/subscription-plans")
 }
 
-// CreatePlan creates a recurring billing plan from p and returns it as JSON, or an
-// error.
-func (s *SubscriptionsService) CreatePlan(ctx context.Context, p PlanParams) (JSON, error) {
+// Create creates a recurring billing plan from p and returns it as JSON, or an
+// error. Pass WithIdempotencyKey to make retries safe.
+func (s *SubscriptionPlansService) Create(ctx context.Context, p PlanParams, opts ...RequestOption) (JSON, error) {
 	var out JSON
-	return out, s.c.do(ctx, http.MethodPost, "/v1/subscription-plans", p, nil, &out)
+	return out, s.c.do(ctx, http.MethodPost, "/v1/subscription-plans", p, headersFrom(opts), &out)
 }
 
-// List returns a keyset-paginated page of subscriptions. q sets page size, cursor,
-// and optional status filter; pass a prior Page.NextCursor as q.Before for the next
-// page (nil NextCursor means last page). See PageQuery and Page.
-func (s *SubscriptionsService) List(ctx context.Context, q PageQuery) (*Page, error) {
-	var out Page
-	return &out, s.c.do(ctx, http.MethodGet, "/v1/subscriptions"+pageQuery(q), nil, nil, &out)
+// List returns a cursor-paginated page of subscriptions. q sets page size, cursor,
+// order, and optional status/search filters; pass a prior Page.NextCursor as
+// q.Before ("" means the last page). See ListQuery.
+func (s *SubscriptionsService) List(ctx context.Context, q ListQuery) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/subscriptions"+qs(q.values()))
 }
 
 // Create subscribes a customer to a plan (see SubscribeParams) and returns the new
-// subscription as JSON, or an error.
-func (s *SubscriptionsService) Create(ctx context.Context, p SubscribeParams) (JSON, error) {
+// subscription as JSON, or an error. Pass WithIdempotencyKey to make retries safe.
+func (s *SubscriptionsService) Create(ctx context.Context, p SubscribeParams, opts ...RequestOption) (JSON, error) {
 	var out JSON
-	return out, s.c.do(ctx, http.MethodPost, "/v1/subscriptions", p, nil, &out)
+	return out, s.c.do(ctx, http.MethodPost, "/v1/subscriptions", p, headersFrom(opts), &out)
 }
 
-// Deductions returns the per-cycle charge history for a subscription.
-// merchantSubNo is the subscription reference. It returns the history as JSON, or
-// an error.
-func (s *SubscriptionsService) Deductions(ctx context.Context, merchantSubNo string) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/subscriptions/"+seg(merchantSubNo)+"/deductions", nil, nil, &out)
+// Deductions returns the per-cycle charge history for a subscription as a Page (one
+// item per cycle). merchantSubNo is the subscription reference. It returns an error
+// if rejected.
+func (s *SubscriptionsService) Deductions(ctx context.Context, merchantSubNo string) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/subscriptions/"+seg(merchantSubNo)+"/deductions")
 }
 
 // Cancel cancels a subscription identified by merchantSubNo and returns the updated
@@ -445,19 +460,17 @@ type GiftCardParams struct {
 	Amount Money `json:"amount"`
 }
 
-// Templates returns the available gift-card design templates as JSON, or an error.
-// Use a returned template's id as GiftCardParams.TemplateID.
-func (s *GiftCardsService) Templates(ctx context.Context) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/giftcards/templates", nil, nil, &out)
+// Templates returns the available gift-card design templates as a Page (one item
+// per template), or an error. Use a returned template's id as GiftCardParams.TemplateID.
+func (s *GiftCardsService) Templates(ctx context.Context) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/giftcards/templates")
 }
 
-// List returns a keyset-paginated page of issued gift cards. q sets page size,
-// cursor, and optional status filter; pass a prior Page.NextCursor as q.Before for
-// the next page (nil NextCursor means last page). See PageQuery and Page.
-func (s *GiftCardsService) List(ctx context.Context, q PageQuery) (*Page, error) {
-	var out Page
-	return &out, s.c.do(ctx, http.MethodGet, "/v1/giftcards"+pageQuery(q), nil, nil, &out)
+// List returns a cursor-paginated page of issued gift cards. q sets page size,
+// cursor, order, and optional status/search filters; pass a prior Page.NextCursor
+// as q.Before ("" means the last page). See ListQuery.
+func (s *GiftCardsService) List(ctx context.Context, q ListQuery) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/giftcards"+qs(q.values()))
 }
 
 // Get looks up an issued gift card by its card number (cardNum) and returns it as
@@ -468,10 +481,10 @@ func (s *GiftCardsService) Get(ctx context.Context, cardNum string) (JSON, error
 }
 
 // Create issues a gift card from p and returns it as JSON (including its card
-// number), or an error.
-func (s *GiftCardsService) Create(ctx context.Context, p GiftCardParams) (JSON, error) {
+// number), or an error. Pass WithIdempotencyKey to make retries safe.
+func (s *GiftCardsService) Create(ctx context.Context, p GiftCardParams, opts ...RequestOption) (JSON, error) {
 	var out JSON
-	return out, s.c.do(ctx, http.MethodPost, "/v1/giftcards", p, nil, &out)
+	return out, s.c.do(ctx, http.MethodPost, "/v1/giftcards", p, headersFrom(opts), &out)
 }
 
 // --- Off-ramp (scopes: payouts:read / payouts:write) ---
@@ -507,18 +520,17 @@ type OffRampWithdrawParams struct {
 	FiatAmount string `json:"fiatAmount"`
 }
 
-// Countries returns the fiat destination countries supported for off-ramp as JSON,
-// or an error.
-func (s *OffRampService) Countries(ctx context.Context) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/offramp/countries", nil, nil, &out)
+// Countries returns the fiat destination countries supported for off-ramp as a Page
+// (one item per country), or an error.
+func (s *OffRampService) Countries(ctx context.Context) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/offramp/countries")
 }
 
-// Banks returns the workspace's registered destination bank accounts as JSON, or an
-// error. Use a returned account's id as OffRampWithdrawParams.BankAccountID.
-func (s *OffRampService) Banks(ctx context.Context) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/offramp/banks", nil, nil, &out)
+// Banks returns the workspace's registered destination bank accounts as a Page (one
+// item per account), or an error. Use a returned account's id as
+// OffRampWithdrawParams.BankAccountID.
+func (s *OffRampService) Banks(ctx context.Context) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/offramp/banks")
 }
 
 // Quote returns a crypto-to-fiat quote (including a quote token and fiat amount) for
@@ -529,18 +541,18 @@ func (s *OffRampService) Quote(ctx context.Context, p OffRampQuoteParams) (JSON,
 }
 
 // Withdraw executes an off-ramp against a quote and registered bank account (see
-// OffRampWithdrawParams) and returns the order as JSON, or an error.
-func (s *OffRampService) Withdraw(ctx context.Context, p OffRampWithdrawParams) (JSON, error) {
+// OffRampWithdrawParams) and returns the order as JSON, or an error. Pass
+// WithIdempotencyKey to make retries safe.
+func (s *OffRampService) Withdraw(ctx context.Context, p OffRampWithdrawParams, opts ...RequestOption) (JSON, error) {
 	var out JSON
-	return out, s.c.do(ctx, http.MethodPost, "/v1/offramp/withdraw", p, nil, &out)
+	return out, s.c.do(ctx, http.MethodPost, "/v1/offramp/withdraw", p, headersFrom(opts), &out)
 }
 
-// Orders returns a keyset-paginated page of off-ramp orders. q sets page size,
-// cursor, and optional status filter; pass a prior Page.NextCursor as q.Before for
-// the next page (nil NextCursor means last page). See PageQuery and Page.
-func (s *OffRampService) Orders(ctx context.Context, q PageQuery) (*Page, error) {
-	var out Page
-	return &out, s.c.do(ctx, http.MethodGet, "/v1/offramp/orders"+pageQuery(q), nil, nil, &out)
+// Orders returns a cursor-paginated page of off-ramp orders. q sets page size,
+// cursor, order, and optional status/search filters; pass a prior Page.NextCursor
+// as q.Before ("" means the last page). See ListQuery.
+func (s *OffRampService) Orders(ctx context.Context, q ListQuery) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/offramp/orders"+qs(q.values()))
 }
 
 // DocFile is a base64-encoded document uploaded inline with an off-ramp bank
@@ -592,10 +604,9 @@ func (s *OffRampService) RegisterBank(ctx context.Context, p BankParams) (JSON, 
 	return out, s.c.do(ctx, http.MethodPost, "/v1/offramp/banks", p, nil, &out)
 }
 
-// DeleteBank removes a registered destination bank account. bankAccountID is the
-// account's id (from RegisterBank or Banks). It returns an error if the request is
-// rejected.
-func (s *OffRampService) DeleteBank(ctx context.Context, bankAccountID string) error {
+// RemoveBank removes a registered destination bank account. bankAccountID is the
+// account's id (from RegisterBank or Banks). It returns an error if rejected.
+func (s *OffRampService) RemoveBank(ctx context.Context, bankAccountID string) error {
 	return s.c.do(ctx, http.MethodDelete, "/v1/offramp/banks/"+seg(bankAccountID), nil, nil, nil)
 }
 
@@ -608,49 +619,6 @@ func (s *OffRampService) SubmitBankMaterials(ctx context.Context, bankAccountID 
 	return out, s.c.do(ctx, http.MethodPost, "/v1/offramp/banks/"+seg(bankAccountID)+"/materials", p, nil, &out)
 }
 
-// --- Transactions / unified ledger (scope: ledger:read) ---
-
-// TransactionsService reads the unified ledger across all operation types. Requires
-// the ledger:read scope.
-type TransactionsService struct{ c *Client }
-
-// TransactionsQuery filters the ledger. All fields are optional; zero/empty fields
-// are omitted from the request.
-type TransactionsQuery struct {
-	// Currency filters to a single asset code, e.g. "USDT". "" = all currencies.
-	Currency string
-	// From is the inclusive start of the time range, in epoch milliseconds (0 = unbounded).
-	From int64
-	// To is the inclusive end of the time range, in epoch milliseconds (0 = unbounded).
-	To int64
-	// Limit is the maximum number of rows to return (0 = server default).
-	Limit int
-	// Offset is the number of rows to skip for offset-based pagination.
-	Offset int
-	// Format selects the response format; "csv" returns an export instead of JSON.
-	Format string
-}
-
-// List returns ledger entries matching q as JSON, or an error. When q.Format is
-// "csv" the response is a CSV export. See TransactionsQuery for the filters.
-func (s *TransactionsService) List(ctx context.Context, q TransactionsQuery) (JSON, error) {
-	m := map[string]string{"currency": q.Currency, "format": q.Format}
-	if q.From > 0 {
-		m["from"] = strconv.FormatInt(q.From, 10)
-	}
-	if q.To > 0 {
-		m["to"] = strconv.FormatInt(q.To, 10)
-	}
-	if q.Limit > 0 {
-		m["limit"] = strconv.Itoa(q.Limit)
-	}
-	if q.Offset > 0 {
-		m["offset"] = strconv.Itoa(q.Offset)
-	}
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/transactions"+qs(m), nil, nil, &out)
-}
-
 // --- Reconciliation (scope: ledger:read) ---
 
 // ReconciliationService reads settlement reconciliation reports that pair each
@@ -658,68 +626,57 @@ func (s *TransactionsService) List(ctx context.Context, q TransactionsQuery) (JS
 // ledger:read scope.
 type ReconciliationService struct{ c *Client }
 
-// ReconciliationQuery filters a reconciliation report by time range and page. All
-// fields are optional; zero values are omitted from the request.
-type ReconciliationQuery struct {
-	// From is the inclusive start of the time range, in epoch milliseconds (0 = unbounded).
-	From int64
-	// To is the inclusive end of the time range, in epoch milliseconds (0 = unbounded).
-	To int64
-	// Limit is the maximum number of rows to return (0 = server default).
-	Limit int
-	// Offset is the number of rows to skip for offset-based pagination.
-	Offset int
+// Payments returns a cursor-paginated page of the settled pay-in reconciliation
+// report matching q (the page carries Total, the true count for the filtered range),
+// or an error. See ReconciliationQuery.
+func (s *ReconciliationService) Payments(ctx context.Context, q ReconciliationQuery) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/reconciliation/payments"+qs(q.values()))
 }
 
-// reconQuery renders a ReconciliationQuery to query params (drops zero fields).
-func reconQuery(q ReconciliationQuery) string {
-	m := map[string]string{}
-	if q.From > 0 {
-		m["from"] = strconv.FormatInt(q.From, 10)
-	}
-	if q.To > 0 {
-		m["to"] = strconv.FormatInt(q.To, 10)
-	}
-	if q.Limit > 0 {
-		m["limit"] = strconv.Itoa(q.Limit)
-	}
-	if q.Offset > 0 {
-		m["offset"] = strconv.Itoa(q.Offset)
-	}
-	return qs(m)
-}
-
-// Payments returns the settled pay-in reconciliation report matching q as JSON, or
-// an error. See ReconciliationQuery for the time-range and pagination filters.
-func (s *ReconciliationService) Payments(ctx context.Context, q ReconciliationQuery) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/reconciliation/payments"+reconQuery(q), nil, nil, &out)
-}
-
-// Withdrawals returns the settled withdrawal/payout reconciliation report matching q
-// as JSON, or an error. See ReconciliationQuery for the time-range and pagination
-// filters.
-func (s *ReconciliationService) Withdrawals(ctx context.Context, q ReconciliationQuery) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/reconciliation/withdrawals"+reconQuery(q), nil, nil, &out)
+// Withdrawals returns a cursor-paginated page of the settled withdrawal/payout
+// reconciliation report matching q (the page carries Total), or an error. See
+// ReconciliationQuery.
+func (s *ReconciliationService) Withdrawals(ctx context.Context, q ReconciliationQuery) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/reconciliation/withdrawals"+qs(q.values()))
 }
 
 // --- Deposits (scope: balances:read) ---
 
-// DepositsService mints on-chain deposit addresses that credit the workspace
-// balance. Requires the balances:read scope.
+// DepositsService lists deposit chains, mints own-balance receive addresses, and
+// reads settled deposit history. Requires the balances:read scope.
 type DepositsService struct{ c *Client }
 
-// Chains returns the blockchain networks available for deposits as JSON, or an
-// error. Use a returned chain code with CreateAddress.
-func (s *DepositsService) Chains(ctx context.Context) (JSON, error) {
-	var out JSON
-	return out, s.c.do(ctx, http.MethodGet, "/v1/deposits/chains", nil, nil, &out)
+// Chains returns the blockchain networks available for deposits as a Page (one item
+// per chain), or an error. Use a returned chain code with CreateAddress.
+func (s *DepositsService) Chains(ctx context.Context) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/deposits/chains")
 }
 
-// CreateAddress mints a deposit address on chain (e.g. "TRX", "ETH") that credits
-// the workspace balance. It returns the address details as JSON, or an error.
+// CreateAddress mints (or returns the existing) deposit address on chain (e.g.
+// "TRX", "ETH") that credits the workspace balance. It is idempotent per chain and
+// returns the address as JSON, or an error.
 func (s *DepositsService) CreateAddress(ctx context.Context, chain string) (JSON, error) {
 	var out JSON
 	return out, s.c.do(ctx, http.MethodPost, "/v1/deposits/address", map[string]string{"chain": chain}, nil, &out)
+}
+
+// Addresses returns a cursor-paginated page of the workspace's minted deposit
+// addresses. q filters by chain and pages; pass a prior Page.NextCursor as q.Before
+// ("" means the last page). See AddressQuery.
+func (s *DepositsService) Addresses(ctx context.Context, q AddressQuery) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/deposits/addresses"+qs(q.values()))
+}
+
+// GetAddress returns the workspace's deposit address for a single chain as JSON, or
+// an error.
+func (s *DepositsService) GetAddress(ctx context.Context, chain string) (JSON, error) {
+	var out JSON
+	return out, s.c.do(ctx, http.MethodGet, "/v1/deposits/addresses/"+seg(chain), nil, nil, &out)
+}
+
+// List returns a cursor-paginated page of settled deposit history. q filters by
+// chain/time range and pages; pass a prior Page.NextCursor as q.Before ("" means
+// the last page). See DepositHistoryQuery.
+func (s *DepositsService) List(ctx context.Context, q DepositHistoryQuery) (*Page[JSON], error) {
+	return getPage[JSON](ctx, s.c, "/v1/deposits"+qs(q.values()))
 }

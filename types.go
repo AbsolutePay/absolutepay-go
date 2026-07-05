@@ -1,12 +1,10 @@
 package absolutepay
 
-import "encoding/json"
-
 // Money is a monetary value: a decimal-string amount together with its currency
 // code, e.g. Money{Amount: "10.00", Currency: "USDT"}. Amounts are ALWAYS strings
 // (never floats) so no precision is lost on the money path.
 type Money struct {
-	// Amount is the decimal value as a string, e.g. "10.00". Never a float.
+	// Amount is the decimal value as a string, e.g. "10.00" (≤6 dp). Never a float.
 	Amount string `json:"amount"`
 	// Currency is the asset/currency code, e.g. "USDT", "BTC", "USD".
 	Currency string `json:"currency"`
@@ -30,6 +28,18 @@ const (
 	PaymentOffRamp PaymentType = "OFFRAMP"
 	// PaymentGiftCard is a gift-card issuance.
 	PaymentGiftCard PaymentType = "GIFTCARD"
+)
+
+// Order is the sort direction for list endpoints. It is a string alias; use
+// OrderAsc / OrderDesc (or pass "asc" / "desc" directly).
+type Order = string
+
+// Sort directions accepted by list endpoints via the order query parameter.
+const (
+	// OrderAsc sorts oldest-first.
+	OrderAsc Order = "asc"
+	// OrderDesc sorts newest-first.
+	OrderDesc Order = "desc"
 )
 
 // Balance is a single asset balance for the workspace.
@@ -61,24 +71,128 @@ type FeePreview struct {
 	NetworkFee string `json:"networkFee"`
 }
 
-// PageQuery holds keyset (cursor) pagination options for list endpoints such as
-// Invoices.List, Subscriptions.List, GiftCards.List, and OffRamp.Orders.
-type PageQuery struct {
-	// Limit is the maximum number of items per page. 0 means the server default.
-	Limit int
-	// Before is the opaque cursor from a previous page's Page.NextCursor. Leave it
-	// empty ("") to fetch the first page.
-	Before string
-	// Status is an optional, endpoint-specific status filter. "" means no filter.
-	Status string
+// Page is one page of a cursor-paginated list. T is the element type; loosely
+// typed lists use Page[JSON]. Callers page by echoing NextCursor back as the
+// query's Before; an empty NextCursor means the last page.
+type Page[T any] struct {
+	// Items holds this page's rows.
+	Items []T `json:"items"`
+	// NextCursor is the opaque cursor for the next page. Pass it back as the list
+	// query's Before. It is "" (null on the wire) on the last page.
+	NextCursor string `json:"nextCursor"`
+	// Total is the true count for the filtered range, independent of paging. It is
+	// only populated by the ledger lists (refunds, conversions) and reconciliation.
+	Total int `json:"total,omitempty"`
 }
 
-// Page is one page of a keyset-paginated list. Items are raw JSON objects that you
-// unmarshal into the concrete type you expect from that endpoint.
-type Page struct {
-	// Items holds the page's rows as raw JSON; unmarshal each into your target type.
-	Items []json.RawMessage `json:"items"`
-	// NextCursor is a response-only opaque cursor. Pass it back as PageQuery.Before
-	// to fetch the next page. It is nil on the last page (no more results).
-	NextCursor *string `json:"nextCursor"`
+// ListQuery holds the shared cursor-pagination + filter options for the resource
+// lists that support a status/search filter: Checkouts, Invoices, GiftCards,
+// Subscriptions, and OffRamp.Orders. All fields are optional.
+type ListQuery struct {
+	// Limit is the maximum number of items per page. 0 means the server default.
+	Limit int
+	// Before is the opaque cursor from a previous page's Page.NextCursor. "" fetches
+	// the first page.
+	Before string
+	// Order is the sort direction, OrderAsc or OrderDesc. "" means the server default.
+	Order Order
+	// Status is an optional, endpoint-specific status filter. "" means no filter.
+	Status string
+	// Q is an optional free-text search filter. "" means no filter.
+	Q string
+}
+
+func (q ListQuery) values() map[string]string {
+	m := map[string]string{"before": q.Before, "order": q.Order, "status": q.Status, "q": q.Q}
+	putInt(m, "limit", q.Limit)
+	return m
+}
+
+// LedgerQuery filters the settled ledger-history lists (Refunds.List and
+// Conversions.List). All fields are optional; zero values are omitted.
+type LedgerQuery struct {
+	// From is the inclusive start of the time range, in epoch milliseconds (0 = unbounded).
+	From int64
+	// To is the inclusive end of the time range, in epoch milliseconds (0 = unbounded).
+	To int64
+	// Currency filters to a single asset code, e.g. "USDT". "" = all currencies.
+	Currency string
+	// Limit is the maximum number of items per page. 0 means the server default.
+	Limit int
+	// Before is the opaque cursor from a previous page's Page.NextCursor.
+	Before string
+	// Order is the sort direction, OrderAsc or OrderDesc.
+	Order Order
+}
+
+func (q LedgerQuery) values() map[string]string {
+	m := map[string]string{"currency": q.Currency, "before": q.Before, "order": q.Order}
+	putInt64(m, "from", q.From)
+	putInt64(m, "to", q.To)
+	putInt(m, "limit", q.Limit)
+	return m
+}
+
+// DepositHistoryQuery filters the settled deposit history (Deposits.List). All
+// fields are optional; zero values are omitted.
+type DepositHistoryQuery struct {
+	// Chain filters to a single blockchain network, e.g. "TRX". "" = all chains.
+	Chain string
+	// From is the inclusive start of the time range, in epoch milliseconds (0 = unbounded).
+	From int64
+	// To is the inclusive end of the time range, in epoch milliseconds (0 = unbounded).
+	To int64
+	// Before is the opaque cursor from a previous page's Page.NextCursor.
+	Before string
+	// Order is the sort direction, OrderAsc or OrderDesc.
+	Order Order
+}
+
+func (q DepositHistoryQuery) values() map[string]string {
+	m := map[string]string{"chain": q.Chain, "before": q.Before, "order": q.Order}
+	putInt64(m, "from", q.From)
+	putInt64(m, "to", q.To)
+	return m
+}
+
+// AddressQuery filters the workspace's minted deposit addresses (Deposits.Addresses).
+// All fields are optional; zero values are omitted.
+type AddressQuery struct {
+	// Chain filters to a single blockchain network, e.g. "TRX". "" = all chains.
+	Chain string
+	// Limit is the maximum number of items per page. 0 means the server default.
+	Limit int
+	// Before is the opaque cursor from a previous page's Page.NextCursor.
+	Before string
+	// Order is the sort direction, OrderAsc or OrderDesc.
+	Order Order
+}
+
+func (q AddressQuery) values() map[string]string {
+	m := map[string]string{"chain": q.Chain, "before": q.Before, "order": q.Order}
+	putInt(m, "limit", q.Limit)
+	return m
+}
+
+// ReconciliationQuery filters a settlement reconciliation report by time range and
+// page. All fields are optional; zero values are omitted.
+type ReconciliationQuery struct {
+	// From is the inclusive start of the time range, in epoch milliseconds (0 = unbounded).
+	From int64
+	// To is the inclusive end of the time range, in epoch milliseconds (0 = unbounded).
+	To int64
+	// Limit is the maximum number of rows per page. 0 means the server default.
+	Limit int
+	// Before is the opaque cursor from a previous page's Page.NextCursor.
+	Before string
+	// Order is the sort direction, OrderAsc or OrderDesc.
+	Order Order
+}
+
+func (q ReconciliationQuery) values() map[string]string {
+	m := map[string]string{"before": q.Before, "order": q.Order}
+	putInt64(m, "from", q.From)
+	putInt64(m, "to", q.To)
+	putInt(m, "limit", q.Limit)
+	return m
 }
