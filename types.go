@@ -14,16 +14,15 @@ type Money struct {
 // string; use the Payment* constants for the accepted values.
 type PaymentType = string
 
-// The set of PaymentType values accepted by fee/preview and related endpoints.
+// The set of PaymentType values accepted by fee/preview. Conversions and subscriptions are not
+// previewable (their cost is a live quote / settled per cycle) and are rejected with 400.
 const (
 	// PaymentCheckout is a pay-in (customer pays the merchant).
 	PaymentCheckout PaymentType = "CHECKOUT"
 	// PaymentWithdrawal is an on-chain payout/withdrawal.
 	PaymentWithdrawal PaymentType = "WITHDRAWAL"
-	// PaymentSubscription is a recurring subscription charge.
-	PaymentSubscription PaymentType = "SUBSCRIPTION"
-	// PaymentConversion is a currency-to-currency conversion.
-	PaymentConversion PaymentType = "CONVERSION"
+	// PaymentPayout is an alias for PaymentWithdrawal (payouts and withdrawals share one fee).
+	PaymentPayout PaymentType = "PAYOUT"
 	// PaymentOffRamp is a crypto-to-fiat off-ramp withdrawal.
 	PaymentOffRamp PaymentType = "OFFRAMP"
 	// PaymentGiftCard is a gift-card issuance.
@@ -52,8 +51,7 @@ type Balance struct {
 	Locked string `json:"locked"`
 }
 
-// FeePreview is the fee breakdown for a given amount: the platform fee is the
-// network base fee plus the account-tier markup.
+// FeePreview is the total fee (and net) for a given amount.
 type FeePreview struct {
 	// Amount is the input amount the fee was computed on, as a decimal string.
 	Amount string `json:"amount"`
@@ -61,14 +59,10 @@ type FeePreview struct {
 	Currency string `json:"currency"`
 	// PaymentType is the operation kind the fee applies to (see the Payment* constants).
 	PaymentType PaymentType `json:"paymentType"`
-	// Fee is the total fee charged, as a decimal string (NetworkFee + Markup).
+	// Fee is the total fee charged on the amount, as a decimal string.
 	Fee string `json:"fee"`
 	// Net is the amount remaining after the fee, as a decimal string.
 	Net string `json:"net"`
-	// Markup is the account-tier margin portion of the fee, as a decimal string.
-	Markup string `json:"markup"`
-	// NetworkFee is the underlying network base fee, as a decimal string.
-	NetworkFee string `json:"networkFee"`
 }
 
 // Page is one page of a cursor-paginated list. T is the element type; loosely
