@@ -57,11 +57,17 @@ type FeesService struct{ c *Client }
 
 // Preview returns the fee breakdown for an amount and payment type. amount is the
 // decimal-string value; currency is its code (e.g. "USDT"); paymentType is one of
-// the Payment* constants (pass "" for the default CHECKOUT). It returns a
-// *FeePreview, or an error.
-func (s *FeesService) Preview(ctx context.Context, amount, currency string, paymentType PaymentType) (*FeePreview, error) {
+// the Payment* constants (pass "" for the default CHECKOUT). chain is the network
+// (e.g. "MATIC"): REQUIRED for PaymentWithdrawal/PaymentPayout (payout fees are
+// per-chain) and ignored for pay-in — pass "" for CHECKOUT. It returns a
+// *FeePreview, or an error (a *Error with Code "chain_required" if chain is missing
+// for a withdrawal/payout).
+func (s *FeesService) Preview(ctx context.Context, amount, currency string, paymentType PaymentType, chain string) (*FeePreview, error) {
+	if (paymentType == PaymentWithdrawal || paymentType == PaymentPayout) && chain == "" {
+		return nil, &Error{Status: 400, Code: "chain_required", Title: "a chain is required to preview a payout/withdrawal fee"}
+	}
 	var out FeePreview
-	q := qs(map[string]string{"amount": amount, "currency": currency, "paymentType": paymentType})
+	q := qs(map[string]string{"amount": amount, "currency": currency, "paymentType": paymentType, "chain": chain})
 	return &out, s.c.do(ctx, http.MethodGet, "/v1/fees/preview"+q, nil, nil, &out)
 }
 
